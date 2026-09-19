@@ -1,0 +1,47 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# Model files
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+
+# Large datasets
+data/raw/*
+data/processed/*
+data/test/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/test/.gitkeep
+
+# Logs
+*.log

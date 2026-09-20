@@ -9,6 +9,7 @@ from processing.segmentation import segment_fingerprint
 from processing.orientation import estimate_orientation
 from processing.frequency import estimate_ridge_frequency
 from processing.density import estimate_ridge_density
+from processing.quality import assess_image_quality
 from processing.features import extract_features
 
 
@@ -39,43 +40,60 @@ def analyze_fingerprint(image):
     mask, segmented = segment_fingerprint(enhanced)
 
     # --------------------------------------------------
-    # 3. Orientation estimation
+    # 3. Image quality assessment
     # --------------------------------------------------
-    orientation, coherence = estimate_orientation(segmented)
+    quality = assess_image_quality(
+        enhanced,
+        mask
+    )
 
     # --------------------------------------------------
-    # 4. Ridge frequency estimation
+    # 4. Orientation estimation
+    # --------------------------------------------------
+    orientation, coherence = estimate_orientation(
+        segmented
+    )
+
+    # --------------------------------------------------
+    # 5. Ridge frequency estimation
     # --------------------------------------------------
     frequency, spacing, frequency_results = (
         estimate_ridge_frequency(segmented)
     )
 
     # --------------------------------------------------
-    # 5. Ridge density estimation
+    # 6. Ridge density estimation
     # --------------------------------------------------
-    density, density_results = estimate_ridge_density(segmented)
+    density, density_results = estimate_ridge_density(
+        segmented
+    )
 
     # --------------------------------------------------
-    # 6. Summary
+    # 7. Summary
     # --------------------------------------------------
     summary = {
         "image_shape": list(image.shape),
+
         "foreground_coverage": float(
             (mask > 0).mean()
         ),
+
         "mean_orientation_coherence": float(
             coherence.mean()
         ),
+
         "ridge_frequency": (
             float(frequency)
             if frequency is not None
             else None
         ),
+
         "ridge_spacing": (
             float(spacing)
             if spacing is not None
             else None
         ),
+
         "ridge_density": (
             float(density)
             if density is not None
@@ -84,10 +102,12 @@ def analyze_fingerprint(image):
     }
 
     # --------------------------------------------------
-    # 7. Processing results
+    # 8. Processing results
     # --------------------------------------------------
     results = {
         "summary": summary,
+
+        "quality": quality,
 
         "preprocessing": {
             "gray": gray,
@@ -119,7 +139,7 @@ def analyze_fingerprint(image):
     }
 
     # --------------------------------------------------
-    # 8. Extract application features
+    # 9. Extract application features
     # --------------------------------------------------
     features = extract_features(results)
 

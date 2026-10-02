@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 
@@ -9,6 +10,14 @@ app = FastAPI(
     title="Fingerprint Feature Analyzer API",
     description="AI-based fingerprint image feature extraction API",
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

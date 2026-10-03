@@ -24,10 +24,7 @@ function App() {
       return
     }
 
-    const allowedTypes = [
-      "image/jpeg",
-      "image/png",
-    ]
+    const allowedTypes = ["image/jpeg", "image/png"]
 
     if (!allowedTypes.includes(file.type)) {
       setError("Please upload a JPG, JPEG, or PNG image.")
@@ -37,9 +34,13 @@ function App() {
       return
     }
 
-    setSelectedFile(file)
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+    }
 
     const objectUrl = URL.createObjectURL(file)
+
+    setSelectedFile(file)
     setPreviewUrl(objectUrl)
 
     const image = new Image()
@@ -49,17 +50,13 @@ function App() {
         width: image.width,
         height: image.height,
       })
-
-      URL.revokeObjectURL(objectUrl)
     }
 
     image.src = objectUrl
   }
 
   const handleAnalyze = async () => {
-    if (!selectedFile) {
-      return
-    }
+    if (!selectedFile) return
 
     setLoading(true)
     setError(null)
@@ -95,7 +92,7 @@ function App() {
     } catch (err) {
       setError(
         err.message ||
-        "Unable to connect to the fingerprint analysis server."
+          "Unable to connect to the fingerprint analysis server."
       )
     } finally {
       setLoading(false)
@@ -103,6 +100,10 @@ function App() {
   }
 
   const handleReset = () => {
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+    }
+
     setSelectedFile(null)
     setPreviewUrl(null)
     setImageDimensions(null)
@@ -110,22 +111,28 @@ function App() {
     setError(null)
   }
 
-  const formatValue = (value, suffix = "") => {
+  const formatNumber = (value, decimals = 3) => {
     if (value === null || value === undefined) {
       return "Not detected"
     }
 
-    if (typeof value === "number") {
-      return `${value.toFixed(3)}${suffix}`
+    if (typeof value !== "number") {
+      return value
     }
 
-    return `${value}${suffix}`
+    return value.toFixed(decimals)
+  }
+
+  const displayValue = (value) => {
+    if (value === null || value === undefined || value === "") {
+      return "Not detected"
+    }
+
+    return value
   }
 
   const downloadJSON = () => {
-    if (!results) {
-      return
-    }
+    if (!results) return
 
     const report = {
       filename: selectedFile?.name || null,
@@ -135,9 +142,7 @@ function App() {
 
     const blob = new Blob(
       [JSON.stringify(report, null, 2)],
-      {
-        type: "application/json",
-      }
+      { type: "application/json" }
     )
 
     const url = URL.createObjectURL(blob)
@@ -148,7 +153,204 @@ function App() {
 
     document.body.appendChild(link)
     link.click()
-    document.body.removeChild(link)
+    link.remove()
+
+    URL.revokeObjectURL(url)
+  }
+
+  const downloadCSV = () => {
+    if (!results) return
+
+    const rows = [
+      ["Category", "Feature", "Value", "Status"],
+
+      [
+        "Pattern",
+        "Pattern Type",
+        displayValue(results.pattern_type),
+        results.pattern_type ? "Detected" : "Not detected",
+      ],
+
+      [
+        "Image Quality",
+        "Mean Intensity",
+        formatNumber(
+          results.image_quality?.mean_intensity
+        ),
+        "Measured",
+      ],
+
+      [
+        "Image Quality",
+        "Intensity Standard Deviation",
+        formatNumber(
+          results.image_quality?.intensity_std
+        ),
+        "Measured",
+      ],
+
+      [
+        "Image Quality",
+        "Local Variance",
+        formatNumber(
+          results.image_quality?.local_variance
+        ),
+        "Measured",
+      ],
+
+      [
+        "Image Quality",
+        "Foreground Pixels",
+        displayValue(
+          results.image_quality?.foreground_pixels
+        ),
+        "Measured",
+      ],
+
+      [
+        "Core",
+        "X",
+        displayValue(results.core?.x),
+        results.core?.x !== null ? "Detected" : "Not detected",
+      ],
+
+      [
+        "Core",
+        "Y",
+        displayValue(results.core?.y),
+        results.core?.y !== null ? "Detected" : "Not detected",
+      ],
+
+      [
+        "Core",
+        "Confidence",
+        displayValue(results.core?.confidence),
+        results.core?.confidence !== null
+          ? "Available"
+          : "Not available",
+      ],
+
+      [
+        "Delta",
+        "X",
+        displayValue(results.delta?.x),
+        results.delta?.x !== null ? "Detected" : "Not detected",
+      ],
+
+      [
+        "Delta",
+        "Y",
+        displayValue(results.delta?.y),
+        results.delta?.y !== null ? "Detected" : "Not detected",
+      ],
+
+      [
+        "Delta",
+        "Confidence",
+        displayValue(results.delta?.confidence),
+        results.delta?.confidence !== null
+          ? "Available"
+          : "Not available",
+      ],
+
+      [
+        "Ridge",
+        "Density",
+        formatNumber(results.ridge?.density),
+        "Measured",
+      ],
+
+      [
+        "Ridge",
+        "Dominant Orientation",
+        results.ridge?.orientation_degrees !== null &&
+        results.ridge?.orientation_degrees !== undefined
+          ? `${formatNumber(
+              results.ridge.orientation_degrees,
+              2
+            )}°`
+          : "Not detected",
+        "Measured",
+      ],
+
+      [
+        "Ridge",
+        "Orientation Coherence",
+        formatNumber(
+          results.ridge?.orientation_coherence
+        ),
+        "Measured",
+      ],
+
+      [
+        "Ridge",
+        "Frequency",
+        formatNumber(results.ridge?.frequency),
+        "Measured",
+      ],
+
+      [
+        "Ridge",
+        "Spacing",
+        results.ridge?.spacing_pixels !== null &&
+        results.ridge?.spacing_pixels !== undefined
+          ? `${formatNumber(
+              results.ridge.spacing_pixels,
+              2
+            )} px`
+          : "Not detected",
+        "Measured",
+      ],
+
+      [
+        "Minutiae",
+        "Total",
+        displayValue(results.minutiae?.total),
+        results.minutiae?.total !== null
+          ? "Detected"
+          : "Not detected",
+      ],
+
+      [
+        "Minutiae",
+        "Ridge Endings",
+        displayValue(results.minutiae?.ridge_endings),
+        results.minutiae?.ridge_endings !== null
+          ? "Detected"
+          : "Not detected",
+      ],
+
+      [
+        "Minutiae",
+        "Bifurcations",
+        displayValue(results.minutiae?.bifurcations),
+        results.minutiae?.bifurcations !== null
+          ? "Detected"
+          : "Not detected",
+      ],
+    ]
+
+    const csv = rows
+      .map((row) =>
+        row
+          .map((cell) => `"${String(cell).replaceAll('"', '""')}"`)
+          .join(",")
+      )
+      .join("\n")
+
+    const blob = new Blob([csv], {
+      type: "text/csv;charset=utf-8;",
+    })
+
+    const url = URL.createObjectURL(blob)
+
+    const link = document.createElement("a")
+    link.href = url
+    link.download = "fingerprint-analysis-report.csv"
+
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
 
     URL.revokeObjectURL(url)
   }
@@ -157,37 +359,65 @@ function App() {
     <div className="app">
 
       <header className="header">
-        <h1>Fingerprint Feature Analyzer</h1>
 
-        <p>
-          AI-Based Fingerprint Image Feature Extraction
-        </p>
+        <div className="header-content">
+
+          <div className="brand-mark">
+            FP
+          </div>
+
+          <div>
+            <h1>Fingerprint Feature Analyzer</h1>
+
+            <p>
+              AI-Based Fingerprint Image Feature Extraction
+            </p>
+          </div>
+
+        </div>
+
       </header>
 
 
       <main className="main-content">
 
-        {/* Upload Section */}
+        {/* Upload */}
 
-        <section className="upload-card">
+        <section className="card upload-card">
 
-          <h2>Upload Fingerprint</h2>
+          <div className="section-heading">
 
-          <p className="upload-description">
-            Upload a fingerprint image to extract measurable
-            image features.
-          </p>
+            <div>
+              <span className="eyebrow">
+                IMAGE INPUT
+              </span>
+
+              <h2>
+                Upload a fingerprint
+              </h2>
+
+              <p>
+                Upload a grayscale or color fingerprint image
+                for automated feature extraction.
+              </p>
+            </div>
+
+          </div>
 
 
           <label className="upload-area">
 
-            <span>
-              Choose fingerprint image
-            </span>
+            <div className="upload-icon">
+              ↑
+            </div>
 
-            <small>
+            <strong>
+              Choose fingerprint image
+            </strong>
+
+            <span>
               JPG, JPEG or PNG
-            </small>
+            </span>
 
             <input
               type="file"
@@ -199,17 +429,29 @@ function App() {
 
 
           {selectedFile && (
-            <div className="file-info">
+            <div className="file-summary">
 
-              <strong>
-                {selectedFile.name}
-              </strong>
+              <div>
+                <span className="file-label">
+                  Selected file
+                </span>
+
+                <strong>
+                  {selectedFile.name}
+                </strong>
+              </div>
 
               {imageDimensions && (
-                <span>
-                  {imageDimensions.width} ×{" "}
-                  {imageDimensions.height}px
-                </span>
+                <div>
+                  <span className="file-label">
+                    Dimensions
+                  </span>
+
+                  <strong>
+                    {imageDimensions.width} ×{" "}
+                    {imageDimensions.height}px
+                  </strong>
+                </div>
               )}
 
             </div>
@@ -217,38 +459,70 @@ function App() {
 
 
           {previewUrl && (
-            <div className="preview-section">
+            <div className="preview-wrapper">
 
-              <h3>Image Preview</h3>
+              <div className="preview-heading">
+                <h3>Image Preview</h3>
 
-              <img
-                src={previewUrl}
-                alt="Fingerprint preview"
-                className="fingerprint-preview"
-              />
+                <span>
+                  Original image
+                </span>
+              </div>
+
+              <div className="preview-container">
+
+                <img
+                  src={previewUrl}
+                  alt="Uploaded fingerprint"
+                  className="fingerprint-preview"
+                />
+
+              </div>
 
             </div>
           )}
 
 
-          <button
-            className="analyze-button"
-            onClick={handleAnalyze}
-            disabled={!selectedFile || loading}
-          >
-            {loading
-              ? "Analyzing fingerprint..."
-              : "Analyze Fingerprint"}
-          </button>
+          <div className="action-row">
 
-
-          {selectedFile && !loading && (
             <button
-              className="reset-button"
-              onClick={handleReset}
+              className="primary-button"
+              onClick={handleAnalyze}
+              disabled={!selectedFile || loading}
             >
-              Reset
+              {loading
+                ? "Analyzing fingerprint..."
+                : "Analyze Fingerprint"}
             </button>
+
+            {selectedFile && !loading && (
+              <button
+                className="secondary-button"
+                onClick={handleReset}
+              >
+                Reset
+              </button>
+            )}
+
+          </div>
+
+
+          {loading && (
+            <div className="loading-state">
+
+              <div className="spinner" />
+
+              <div>
+                <strong>
+                  Analyzing fingerprint...
+                </strong>
+
+                <span>
+                  Running preprocessing and feature extraction
+                </span>
+              </div>
+
+            </div>
           )}
 
         </section>
@@ -258,9 +532,21 @@ function App() {
 
         {error && (
           <section className="error-card">
-            <strong>Analysis Error</strong>
 
-            <p>{error}</p>
+            <div className="error-icon">
+              !
+            </div>
+
+            <div>
+              <strong>
+                Analysis failed
+              </strong>
+
+              <p>
+                {error}
+              </p>
+            </div>
+
           </section>
         )}
 
@@ -273,83 +559,92 @@ function App() {
             <div className="results-header">
 
               <div>
-                <h2>Analysis Results</h2>
+                <span className="eyebrow">
+                  ANALYSIS COMPLETE
+                </span>
+
+                <h2>
+                  Extracted Features
+                </h2>
 
                 <p>
-                  Extracted fingerprint image features
+                  Measurements generated from the uploaded
+                  fingerprint image.
                 </p>
               </div>
 
-              <button
-                className="download-button"
-                onClick={downloadJSON}
-              >
-                Download JSON
-              </button>
+              <div className="download-actions">
+
+                <button
+                  className="secondary-button"
+                  onClick={downloadCSV}
+                >
+                  Download CSV
+                </button>
+
+                <button
+                  className="secondary-button"
+                  onClick={downloadJSON}
+                >
+                  Download JSON
+                </button>
+
+              </div>
 
             </div>
 
 
             {/* Pattern */}
 
-            <div className="result-card">
+            <div className="card result-card">
 
-              <h3>Fingerprint Pattern</h3>
+              <div className="card-title-row">
 
-              <div className="single-result">
+                <div>
+                  <h3>Pattern</h3>
 
-                <span>Pattern type</span>
+                  <p>
+                    Global fingerprint pattern classification
+                  </p>
+                </div>
 
-                <strong>
-                  {results.pattern_type || "Not detected"}
-                </strong>
+                <span
+                  className={
+                    results.pattern_type
+                      ? "status-badge detected"
+                      : "status-badge unavailable"
+                  }
+                >
+                  {results.pattern_type
+                    ? "Detected"
+                    : "Not detected"}
+                </span>
 
               </div>
 
-            </div>
 
+              <div className="feature-table">
 
-            {/* Image Quality */}
-
-            <div className="result-card">
-
-              <h3>Image Quality</h3>
-
-              <div className="feature-grid">
-
-                <div className="feature-item">
-                  <span>Mean intensity</span>
-                  <strong>
-                    {formatValue(
-                      results.image_quality?.mean_intensity
-                    )}
-                  </strong>
+                <div className="table-row table-header">
+                  <span>Feature</span>
+                  <span>Value</span>
+                  <span>Status</span>
                 </div>
 
-                <div className="feature-item">
-                  <span>Intensity standard deviation</span>
+                <div className="table-row">
+                  <span>Pattern type</span>
+
                   <strong>
-                    {formatValue(
-                      results.image_quality?.intensity_std
+                    {displayValue(
+                      results.pattern_type
                     )}
                   </strong>
-                </div>
 
-                <div className="feature-item">
-                  <span>Local variance</span>
-                  <strong>
-                    {formatValue(
-                      results.image_quality?.local_variance
-                    )}
-                  </strong>
-                </div>
-
-                <div className="feature-item">
-                  <span>Foreground pixels</span>
-                  <strong>
-                    {results.image_quality?.foreground_pixels ??
-                      "Not detected"}
-                  </strong>
+                  <span>
+                    {results.pattern_type
+                      ? "Detected"
+                      : "Not detected"}
+                  </span>
                 </div>
 
               </div>
@@ -359,56 +654,104 @@ function App() {
 
             {/* Core / Delta */}
 
-            <div className="result-card">
+            <div className="card result-card">
 
-              <h3>Core & Delta</h3>
+              <div className="card-title-row">
 
-              <div className="feature-grid">
+                <div>
+                  <h3>Core & Delta</h3>
 
-                <div className="feature-item">
+                  <p>
+                    Singular-point candidates from ridge orientation
+                    analysis
+                  </p>
+                </div>
+
+              </div>
+
+
+              <div className="feature-table">
+
+                <div className="table-row table-header">
+                  <span>Feature</span>
+                  <span>Value</span>
+                  <span>Status</span>
+                </div>
+
+                <div className="table-row">
                   <span>Core X</span>
                   <strong>
-                    {results.core?.x ?? "Not detected"}
+                    {displayValue(results.core?.x)}
                   </strong>
+                  <span>
+                    {results.core?.x !== null
+                      ? "Detected"
+                      : "Not detected"}
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Core Y</span>
                   <strong>
-                    {results.core?.y ?? "Not detected"}
+                    {displayValue(results.core?.y)}
                   </strong>
+                  <span>
+                    {results.core?.y !== null
+                      ? "Detected"
+                      : "Not detected"}
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Core confidence</span>
                   <strong>
-                    {results.core?.confidence
-                      ? formatValue(results.core.confidence)
+                    {results.core?.confidence !== null
+                      ? formatNumber(results.core.confidence)
                       : "Not detected"}
                   </strong>
+                  <span>
+                    {results.core?.confidence !== null
+                      ? "Available"
+                      : "Not available"}
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Delta X</span>
                   <strong>
-                    {results.delta?.x ?? "Not detected"}
+                    {displayValue(results.delta?.x)}
                   </strong>
+                  <span>
+                    {results.delta?.x !== null
+                      ? "Detected"
+                      : "Not detected"}
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Delta Y</span>
                   <strong>
-                    {results.delta?.y ?? "Not detected"}
+                    {displayValue(results.delta?.y)}
                   </strong>
+                  <span>
+                    {results.delta?.y !== null
+                      ? "Detected"
+                      : "Not detected"}
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Delta confidence</span>
                   <strong>
-                    {results.delta?.confidence
-                      ? formatValue(results.delta.confidence)
+                    {results.delta?.confidence !== null
+                      ? formatNumber(results.delta.confidence)
                       : "Not detected"}
                   </strong>
+                  <span>
+                    {results.delta?.confidence !== null
+                      ? "Available"
+                      : "Not available"}
+                  </span>
                 </div>
 
               </div>
@@ -416,57 +759,163 @@ function App() {
             </div>
 
 
-            {/* Ridge Features */}
+            {/* Ridge */}
 
-            <div className="result-card">
+            <div className="card result-card">
 
-              <h3>Ridge Features</h3>
+              <div className="card-title-row">
 
-              <div className="feature-grid">
+                <div>
+                  <h3>Ridge Features</h3>
 
-                <div className="feature-item">
+                  <p>
+                    Measured properties of the fingerprint ridge
+                    structure
+                  </p>
+                </div>
+
+                <span className="status-badge detected">
+                  Measured
+                </span>
+
+              </div>
+
+
+              <div className="feature-table">
+
+                <div className="table-row table-header">
+                  <span>Feature</span>
+                  <span>Value</span>
+                  <span>Unit / Status</span>
+                </div>
+
+                <div className="table-row">
                   <span>Ridge density</span>
                   <strong>
-                    {formatValue(
-                      results.ridge?.density
-                    )}
+                    {formatNumber(results.ridge?.density)}
                   </strong>
+                  <span>
+                    peaks / pixel
+                  </span>
                 </div>
 
-                <div className="feature-item">
-                  <span>Dominant orientation</span>
+                <div className="table-row">
+                  <span>Dominant ridge orientation</span>
                   <strong>
-                    {formatValue(
-                      results.ridge?.orientation_degrees,
-                      "°"
-                    )}
+                    {results.ridge?.orientation_degrees !== null &&
+                    results.ridge?.orientation_degrees !== undefined
+                      ? `${formatNumber(
+                          results.ridge.orientation_degrees,
+                          2
+                        )}°`
+                      : "Not detected"}
                   </strong>
+                  <span>
+                    degrees
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Orientation coherence</span>
                   <strong>
-                    {formatValue(
+                    {formatNumber(
                       results.ridge?.orientation_coherence
                     )}
                   </strong>
+                  <span>
+                    0–1
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Ridge frequency</span>
                   <strong>
-                    {formatValue(
+                    {formatNumber(
                       results.ridge?.frequency
+                    )}
+                  </strong>
+                  <span>
+                    cycles / pixel
+                  </span>
+                </div>
+
+                <div className="table-row">
+                  <span>Ridge spacing</span>
+                  <strong>
+                    {results.ridge?.spacing_pixels !== null &&
+                    results.ridge?.spacing_pixels !== undefined
+                      ? `${formatNumber(
+                          results.ridge.spacing_pixels,
+                          2
+                        )} px`
+                      : "Not detected"}
+                  </strong>
+                  <span>
+                    pixels
+                  </span>
+                </div>
+
+              </div>
+
+            </div>
+
+
+            {/* Image Quality */}
+
+            <div className="card result-card">
+
+              <div className="card-title-row">
+
+                <div>
+                  <h3>Image Quality</h3>
+
+                  <p>
+                    Measured image characteristics within the
+                    segmented foreground
+                  </p>
+                </div>
+
+                <span className="status-badge detected">
+                  Measured
+                </span>
+
+              </div>
+
+
+              <div className="metric-grid">
+
+                <div className="metric-box">
+                  <span>Mean intensity</span>
+                  <strong>
+                    {formatNumber(
+                      results.image_quality?.mean_intensity
                     )}
                   </strong>
                 </div>
 
-                <div className="feature-item">
-                  <span>Ridge spacing</span>
+                <div className="metric-box">
+                  <span>Intensity deviation</span>
                   <strong>
-                    {formatValue(
-                      results.ridge?.spacing_pixels,
-                      " px"
+                    {formatNumber(
+                      results.image_quality?.intensity_std
+                    )}
+                  </strong>
+                </div>
+
+                <div className="metric-box">
+                  <span>Local variance</span>
+                  <strong>
+                    {formatNumber(
+                      results.image_quality?.local_variance
+                    )}
+                  </strong>
+                </div>
+
+                <div className="metric-box">
+                  <span>Foreground pixels</span>
+                  <strong>
+                    {displayValue(
+                      results.image_quality?.foreground_pixels
                     )}
                   </strong>
                 </div>
@@ -478,69 +927,110 @@ function App() {
 
             {/* Minutiae */}
 
-            <div className="result-card">
+            <div className="card result-card">
 
-              <h3>Minutiae</h3>
+              <div className="card-title-row">
 
-              <div className="feature-grid">
+                <div>
+                  <h3>Minutiae</h3>
 
-                <div className="feature-item">
+                  <p>
+                    Ridge endings and bifurcation measurements
+                  </p>
+                </div>
+
+                <span className="status-badge unavailable">
+                  Not validated
+                </span>
+
+              </div>
+
+
+              <div className="feature-table">
+
+                <div className="table-row table-header">
+                  <span>Feature</span>
+                  <span>Value</span>
+                  <span>Status</span>
+                </div>
+
+                <div className="table-row">
                   <span>Total minutiae</span>
                   <strong>
-                    {results.minutiae?.total ??
-                      "Not detected"}
+                    {displayValue(
+                      results.minutiae?.total
+                    )}
                   </strong>
+                  <span>
+                    Not detected
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Ridge endings</span>
                   <strong>
-                    {results.minutiae?.ridge_endings ??
-                      "Not detected"}
+                    {displayValue(
+                      results.minutiae?.ridge_endings
+                    )}
                   </strong>
+                  <span>
+                    Not detected
+                  </span>
                 </div>
 
-                <div className="feature-item">
+                <div className="table-row">
                   <span>Bifurcations</span>
                   <strong>
-                    {results.minutiae?.bifurcations ??
-                      "Not detected"}
+                    {displayValue(
+                      results.minutiae?.bifurcations
+                    )}
                   </strong>
+                  <span>
+                    Not detected
+                  </span>
                 </div>
 
               </div>
 
-              <p className="not-detected-note">
-                Minutiae points are currently not reported
-                because the experimental detector has not
-                reached a reliable validation level.
-              </p>
+              <div className="info-note">
+                Minutiae are currently withheld because the
+                experimental detector has not reached a reliable
+                validation level.
+              </div>
 
             </div>
 
 
             {/* Transparency */}
 
-            <div className="transparency-note">
+            <div className="transparency-card">
 
-              <strong>
-                Scientific transparency
-              </strong>
+              <div className="transparency-icon">
+                i
+              </div>
 
-              <p>
-                Features are generated by automated image
-                analysis. Confidence values represent model
-                or measurement estimates and should not be
-                interpreted as certainty.
-              </p>
+              <div>
 
-              <p>
-                This application performs image feature
-                extraction only. It does not identify a
-                person, compare fingerprints against a
-                database, or make forensic authentication
-                decisions.
-              </p>
+                <strong>
+                  Scientific transparency
+                </strong>
+
+                <p>
+                  Features are generated by automated image
+                  analysis. Confidence values represent model
+                  or measurement estimates and should not be
+                  interpreted as certainty.
+                </p>
+
+                <p>
+                  This application performs fingerprint image
+                  feature extraction only. It does not identify
+                  a person, compare fingerprints against a
+                  database, or make forensic authentication
+                  decisions.
+                </p>
+
+              </div>
 
             </div>
 

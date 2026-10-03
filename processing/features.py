@@ -1,80 +1,558 @@
 import numpy as np
 
 
-def extract_features(results):
+def _safe_float(value):
     """
-    Convert pipeline results into a clean fingerprint
-    feature structure.
+    Convert NumPy/Python numeric values into a JSON-safe float.
 
-    Features that are not reliably detected are returned
-    as None rather than being guessed.
+    Returns None for invalid or non-finite values.
+    """
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(value):
+        return None
+
+    return value
+
+
+def _safe_int(value):
+    """
+    Convert NumPy/Python numeric values into a JSON-safe integer.
+
+    Returns None for invalid values.
+    """
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_bool(value):
+    """
+    Convert NumPy/Python boolean values into native Python bool.
+    """
+    if value is None:
+        return False
+
+    return bool(value)
+
+
+def _extract_point(point):
+    """
+    Convert a minutiae point into a clean JSON-safe structure.
     """
 
-    summary = results["summary"]
-    quality = results["quality"]
+    if not isinstance(point, dict):
+        return None
 
-    orientation_map = results["orientation"]["orientation"]
-    coherence_map = results["orientation"]["coherence"]
-    mask = results["segmentation"]["mask"]
+    x = _safe_int(point.get("x"))
+    y = _safe_int(point.get("y"))
 
-    # --------------------------------------------------
-    # Orientation measurement
-    # --------------------------------------------------
-    valid_orientation = orientation_map[mask > 0]
-    valid_coherence = coherence_map[mask > 0]
+    if x is None or y is None:
+        return None
 
-    if valid_orientation.size > 0:
-        ridge_orientation = float(
-            np.median(valid_orientation)
-        )
+    orientation = _safe_float(
+        point.get("orientation")
+    )
 
-        orientation_coherence = float(
-            np.median(valid_coherence)
-        )
-    else:
-        ridge_orientation = None
-        orientation_coherence = None
+    confidence = _safe_float(
+        point.get("confidence")
+    )
 
-    # --------------------------------------------------
-    # Feature structure
-    # --------------------------------------------------
-    features = {
-        "pattern_type": None,
+    point_type = point.get("type")
 
-        "image_quality": {
-            "mean_intensity": quality["mean_intensity"],
-            "intensity_std": quality["intensity_std"],
-            "local_variance": quality["local_variance"],
-            "foreground_pixels": quality["foreground_pixels"],
-        },
+    if point_type is not None:
+        point_type = str(point_type)
 
-        "core": {
-            "x": None,
-            "y": None,
-            "confidence": None,
-        },
+    return {
+        "x": x,
+        "y": y,
+        "type": point_type,
+        "orientation": orientation,
+        "confidence": confidence,
+    }
 
-        "delta": {
-            "x": None,
-            "y": None,
-            "confidence": None,
-        },
 
-        "ridge": {
-            "count": None,
-            "density": summary["ridge_density"],
-            "orientation": ridge_orientation,
-            "orientation_coherence": orientation_coherence,
-            "frequency": summary["ridge_frequency"],
-            "spacing": summary["ridge_spacing"],
-        },
+def _extract_minutiae(results):
+    """
+    Read minutiae results from the pipeline.
 
-        "minutiae": {
+    Supports the detector output:
+
+        results["minutiae"]
+
+    If no detector has been connected yet, the function
+    safely returns an unavailable result.
+    """
+
+    detector = results.get("minutiae")
+
+    if not isinstance(detector, dict):
+        return {
             "total": None,
             "ridge_endings": None,
             "bifurcations": None,
             "points": [],
-        },
+            "reliable": False,
+        }
+
+    raw_points = detector.get(
+        "points",
+        []
+    )
+
+    points = []
+
+    if isinstance(raw_points, list):
+        for point in raw_points:
+
+            clean_point = _extract_point(point)
+
+            if clean_point is not None:
+                points.append(clean_point)
+
+    reliable = _safe_bool(
+        detector.get("reliable", False)
+    )
+
+    total = _safe_int(
+        detector.get("total")
+    )
+
+    ridge_endings = _safe_int(
+        detector.get("ridge_endings")
+    )
+
+    bifurcations = _safe_int(
+        detector.get("bifurcations")
+    )
+
+    # Never report counts if the detector explicitly
+    # marked its result as unreliable.
+    if not reliable:
+        return {
+            "total": None,
+            "ridge_endings": None,
+            "bifurcations": None,
+            "points": [],
+            "reliable": False,
+        }
+
+    # Recalculate total from the actual returned points
+    # when possible. This prevents inconsistent counts.
+    if points:
+        total = len(points)
+
+        ridge_endings = sum(
+            1
+            for point in points
+            if point["type"] == "ridge_ending"
+        )
+
+        bifurcations = sum(
+            1
+            for point in points
+            if point["type"] == "bifurcation"
+        )
+
+    return {
+        "total": total,
+        "ridge_endings": ridge_endings,
+        "bifurcations": bifurcations,
+        "points": points,
+        "reliable": True,
+    }
+
+
+def _extract_singular_point(results, name):
+    """
+    Extract a core or delta result from the pipeline.
+
+    Supported forms:
+
+        {
+            "x": ...,
+            "y": ...,
+            "confidence": ...
+        }
+
+    or:
+
+        {
+            "detected": True,
+            "x": ...,
+            "y": ...,
+            "confidence": ...
+        }
+    """
+
+    singular_results = results.get(
+        "singular_points"
+    )
+
+    if not isinstance(
+        singular_results,
+        dict
+    ):
+        return {
+            "x": None,
+            "y": None,
+            "confidence": None,
+        }
+
+    point = singular_results.get(name)
+
+    if not isinstance(point, dict):
+        return {
+            "x": None,
+            "y": None,
+            "confidence": None,
+        }
+
+    detected = point.get(
+        "detected",
+        True
+    )
+
+    if not bool(detected):
+        return {
+            "x": None,
+            "y": None,
+            "confidence": None,
+        }
+
+    x = _safe_int(
+        point.get("x")
+    )
+
+    y = _safe_int(
+        point.get("y")
+    )
+
+    confidence = _safe_float(
+        point.get("confidence")
+    )
+
+    if x is None or y is None:
+        return {
+            "x": None,
+            "y": None,
+            "confidence": None,
+        }
+
+    return {
+        "x": x,
+        "y": y,
+        "confidence": confidence,
+    }
+
+
+def _extract_pattern(results):
+    """
+    Extract pattern classification from the pipeline.
+
+    Supported pipeline format:
+
+        results["pattern"]
+
+    Example:
+
+        {
+            "label": "Loop",
+            "confidence": 0.91
+        }
+
+    The classifier must provide the result.
+    This function never infers the class from the filename.
+    """
+
+    pattern_result = results.get(
+        "pattern"
+    )
+
+    if not isinstance(
+        pattern_result,
+        dict
+    ):
+        return None
+
+    label = pattern_result.get(
+        "label"
+    )
+
+    if label is None:
+        label = pattern_result.get(
+            "pattern_type"
+        )
+
+    if label is None:
+        return None
+
+    label = str(label).strip()
+
+    if not label:
+        return None
+
+    allowed_patterns = {
+        "arch",
+        "loop",
+        "whorl",
+        "unknown",
+    }
+
+    normalized = label.lower()
+
+    if normalized not in allowed_patterns:
+        return None
+
+    if normalized == "unknown":
+        return None
+
+    # Keep the UI-friendly capitalization.
+    return normalized.capitalize()
+
+
+def extract_features(results):
+    """
+    Convert complete fingerprint pipeline results into
+    a clean, JSON-safe feature structure.
+
+    This function DOES NOT perform detection itself.
+
+    It collects outputs from:
+        - pattern detector
+        - singular-point detector
+        - minutiae detector
+        - ridge analysis
+        - image-quality analysis
+
+    Missing or unreliable detector results remain None.
+    """
+
+    if not isinstance(results, dict):
+        raise TypeError(
+            "results must be a dictionary."
+        )
+
+    summary = results.get(
+        "summary",
+        {}
+    )
+
+    quality = results.get(
+        "quality",
+        {}
+    )
+
+    orientation_results = results.get(
+        "orientation",
+        {}
+    )
+
+    segmentation_results = results.get(
+        "segmentation",
+        {}
+    )
+
+    orientation_map = orientation_results.get(
+        "orientation"
+    )
+
+    coherence_map = orientation_results.get(
+        "coherence"
+    )
+
+    mask = segmentation_results.get(
+        "mask"
+    )
+
+    # --------------------------------------------------
+    # Orientation measurement
+    # --------------------------------------------------
+
+    ridge_orientation = None
+    orientation_coherence = None
+
+    if (
+        orientation_map is not None
+        and coherence_map is not None
+        and mask is not None
+    ):
+
+        try:
+
+            valid_mask = mask > 0
+
+            valid_orientation = (
+                orientation_map[valid_mask]
+            )
+
+            valid_coherence = (
+                coherence_map[valid_mask]
+            )
+
+            valid_orientation = (
+                valid_orientation[
+                    np.isfinite(valid_orientation)
+                ]
+            )
+
+            valid_coherence = (
+                valid_coherence[
+                    np.isfinite(valid_coherence)
+                ]
+            )
+
+            if valid_orientation.size > 0:
+                ridge_orientation = float(
+                    np.median(
+                        valid_orientation
+                    )
+                )
+
+            if valid_coherence.size > 0:
+                orientation_coherence = float(
+                    np.clip(
+                        np.median(
+                            valid_coherence
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+            ridge_orientation = None
+            orientation_coherence = None
+
+    # --------------------------------------------------
+    # Pattern
+    # --------------------------------------------------
+
+    pattern_type = _extract_pattern(
+        results
+    )
+
+    # --------------------------------------------------
+    # Core
+    # --------------------------------------------------
+
+    core = _extract_singular_point(
+        results,
+        "core"
+    )
+
+    # --------------------------------------------------
+    # Delta
+    # --------------------------------------------------
+
+    delta = _extract_singular_point(
+        results,
+        "delta"
+    )
+
+    # --------------------------------------------------
+    # Minutiae
+    # --------------------------------------------------
+
+    minutiae = _extract_minutiae(
+        results
+    )
+
+    # --------------------------------------------------
+    # Image quality
+    # --------------------------------------------------
+
+    image_quality = {
+        "mean_intensity": _safe_float(
+            quality.get(
+                "mean_intensity"
+            )
+        ),
+
+        "intensity_std": _safe_float(
+            quality.get(
+                "intensity_std"
+            )
+        ),
+
+        "local_variance": _safe_float(
+            quality.get(
+                "local_variance"
+            )
+        ),
+
+        "foreground_pixels": _safe_int(
+            quality.get(
+                "foreground_pixels"
+            )
+        ),
+    }
+
+    # --------------------------------------------------
+    # Ridge features
+    # --------------------------------------------------
+
+    ridge = {
+        "count": _safe_int(
+            summary.get(
+                "ridge_count"
+            )
+        ),
+
+        "density": _safe_float(
+            summary.get(
+                "ridge_density"
+            )
+        ),
+
+        "orientation": ridge_orientation,
+
+        "orientation_coherence":
+            orientation_coherence,
+
+        "frequency": _safe_float(
+            summary.get(
+                "ridge_frequency"
+            )
+        ),
+
+        "spacing": _safe_float(
+            summary.get(
+                "ridge_spacing"
+            )
+        ),
+    }
+
+    # --------------------------------------------------
+    # Final structure
+    # --------------------------------------------------
+
+    features = {
+        "pattern_type": pattern_type,
+
+        "image_quality": image_quality,
+
+        "core": core,
+
+        "delta": delta,
+
+        "ridge": ridge,
+
+        "minutiae": minutiae,
     }
 
     return features

@@ -183,6 +183,11 @@ async def analyze_fingerprint_endpoint(
                     "pattern_type"
                 ],
 
+            "pattern_details":
+                features[
+                    "pattern_details"
+                ],
+
             "image_quality":
                 features[
                     "image_quality"

@@ -14,27 +14,52 @@ def _empty_result():
         "bifurcations": None,
         "points": [],
         "reliable": False,
+        "reasons": ["detector_unavailable"],
     }
 
 
 def _crossing_number(neighborhood):
     """
-    Crossing Number (CN) for an 8-neighbourhood.
+    Crossing Number (CN) of the centre pixel of a 3x3 neighbourhood.
 
-    CN = 1 -> ridge ending
-    CN = 3 -> bifurcation
+        CN = 1 -> ridge ending,  CN = 3 -> bifurcation
+
+    BUG FIXED: the original built the ring as
+    [p0, p1, p2, p5, p3, p4, p6, p7, p0] from the flattened 3x3 block.
+    That order is not a walk around the centre (it visits the centre
+    pixel p4 and skips p8), so CN was wrong for most configurations:
+    only ~3/8 true ending patterns and ~8/16 true bifurcation
+    patterns were recognised, and several non-minutia staircase
+    patterns were accepted. The correct clockwise ring is
+    p0, p1, p2, p5, p8, p7, p6, p3.
     """
-    p = neighborhood.flatten().astype(np.uint8)
+    p = np.asarray(neighborhood).flatten().astype(np.int16)
 
-    # Clockwise order around the center pixel.
-    ring = np.array([
-        p[0], p[1], p[2],
-        p[5],       p[3],
-        p[4], p[6], p[7],
-        p[0],
-    ])
+    ring = [p[0], p[1], p[2], p[5], p[8], p[7], p[6], p[3], p[0]]
 
-    return int(np.sum(np.abs(np.diff(ring.astype(np.int16)))) // 2)
+    return int(sum(abs(ring[i + 1] - ring[i]) for i in range(8)) // 2)
+
+
+def crossing_number_map(skeleton):
+    """Vectorised crossing number for every skeleton pixel (0 elsewhere)."""
+    sk = np.pad(skeleton.astype(np.int16), 1)
+
+    ring = [
+        sk[0:-2, 0:-2], sk[0:-2, 1:-1], sk[0:-2, 2:],
+        sk[1:-1, 2:],
+        sk[2:, 2:], sk[2:, 1:-1], sk[2:, 0:-2],
+        sk[1:-1, 0:-2],
+    ]
+
+    total = np.zeros(skeleton.shape, dtype=np.int16)
+
+    for i in range(8):
+        total += np.abs(ring[i] - ring[(i + 1) % 8])
+
+    cn = total // 2
+    cn[~skeleton.astype(bool)] = 0
+
+    return cn
 
 
 def _distance_to_mask_boundary(mask):
@@ -372,27 +397,170 @@ def cluster_points(points, min_distance):
 # Minutiae detection
 # ============================================================
 
+def _trace_direction(skeleton, y, x, steps=10):
+    """
+    Walk along each skeleton branch leaving (y, x) for up to ``steps``
+    pixels. Returns a list of angles (radians, image coords, y down)
+    from the point to the end of every branch.
+    """
+    h, w = skeleton.shape
+    angles = []
+
+    starts = [
+        (y + dy, x + dx)
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if (dy or dx)
+        and 0 <= y + dy < h
+        and 0 <= x + dx < w
+        and skeleton[y + dy, x + dx]
+    ]
+
+    for sy, sx in starts:
+        visited = {(y, x), (sy, sx)}
+        cy, cx = sy, sx
+
+        for _ in range(steps - 1):
+            nxt = None
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        (dy or dx)
+                        and 0 <= ny < h
+                        and 0 <= nx < w
+                        and skeleton[ny, nx]
+                        and (ny, nx) not in visited
+                        # do not cross into another branch of the
+                        # starting junction
+                        and max(abs(ny - y), abs(nx - x)) > 1
+                    ):
+                        nxt = (ny, nx)
+                        break
+                if nxt:
+                    break
+            if nxt is None:
+                break
+            visited.add(nxt)
+            cy, cx = nxt
+
+        if (cy, cx) != (y, x):
+            angles.append(float(np.arctan2(cy - y, cx - x)))
+
+    return angles
+
+
+def _minutia_angle(skeleton, y, x, minutia_type):
+    """
+    Minutia direction in [0, 2*pi) (image coordinates, y down).
+
+    ridge_ending: direction pointing from the ridge body OUT through
+                  the ending (away from the ridge).
+    bifurcation:  direction in which the two daughter branches open
+                  (opposite to the single stem).
+
+    Returns None if the local skeleton cannot be traced.
+    """
+    angles = _trace_direction(skeleton, y, x)
+
+    if minutia_type == "ridge_ending":
+        if not angles:
+            return None
+        return float((angles[0] + np.pi) % (2 * np.pi))
+
+    if len(angles) < 3:
+        return None
+
+    vectors = np.exp(1j * np.asarray(angles[:3]))
+
+    def separation(i):
+        others = [j for j in range(3) if j != i]
+        return min(
+            abs(np.angle(vectors[i] / vectors[j])) for j in others
+        )
+
+    stem = max(range(3), key=separation)
+    daughters = [j for j in range(3) if j != stem]
+
+    return float(np.angle(vectors[daughters].sum()) % (2 * np.pi))
+
+
+def _angle_difference(a, b):
+    return abs(float(np.angle(np.exp(1j * (a - b)))))
+
+
+def _remove_spurious_pairs(points, period):
+    """
+    Remove the classic false-minutiae signatures:
+
+      * two endings facing each other across a short gap (broken ridge)
+      * an ending next to a bifurcation (spur / bridge artefact)
+      * two bifurcations very close together (bridge)
+    """
+    drop = set()
+    gap = 1.3 * period
+    near = 0.8 * period
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            a, b = points[i], points[j]
+            d = np.hypot(a["x"] - b["x"], a["y"] - b["y"])
+
+            if d > gap:
+                continue
+
+            both_ending = (
+                a["type"] == "ridge_ending" and b["type"] == "ridge_ending"
+            )
+
+            if both_ending:
+                if (
+                    a.get("angle") is not None
+                    and b.get("angle") is not None
+                ):
+                    if _angle_difference(a["angle"], b["angle"]) > 2.2:
+                        drop.update((i, j))
+                continue
+
+            if d <= near:
+                drop.update((i, j))
+
+    return [p for k, p in enumerate(points) if k not in drop]
+
+
 def detect_minutiae(
     skeleton,
     mask,
     orientation,
     coherence,
+    ridge_spacing=None,
 ):
     """
     Detect fingerprint ridge endings and bifurcations.
 
-    Detection is deliberately conservative:
-        - segmentation-boundary rejection
-        - minimum distance from mask boundary
-        - crossing-number classification
-        - local ridge support
-        - local orientation coherence
-        - short-spur pruning
-        - duplicate suppression
-        - global sanity checks
+    Stages: boundary rejection, correct crossing-number
+    classification, local support, coherence, junction-noise test,
+    duplicate suppression, spurious-pair removal, true minutia
+    direction.
 
-    If the resulting set is not trustworthy, the function returns
-    reliable=False and does not fabricate feature counts.
+    Changes relative to the original
+    --------------------------------
+    * Correct crossing number (see ``_crossing_number``).
+    * The "branching noise" test counted pixels with >= 3 skeleton
+      neighbours. Ordinary staircase pixels satisfy that, so it
+      rejected about half of all good candidates. It now counts real
+      junctions (CN >= 3).
+    * Distance thresholds scale with the measured ridge spacing
+      instead of image size.
+    * No more all-or-nothing discard. The original threw away EVERY
+      minutia when the count fell outside [2, 120], but a rolled
+      print legitimately has 100-200 minutiae, and the density /
+      confidence checks hid everything else. Points are always
+      returned; ``reliable`` and ``reasons`` describe the quality.
+    * ``angle`` is a real minutia direction (0..2*pi) traced along the
+      skeleton. The old ``orientation`` was the pi-periodic gradient
+      angle sampled at the pixel (perpendicular to the ridge).
+      ``orientation`` is now the ridge orientation at the point.
     """
     if skeleton is None or mask is None:
         return _empty_result()
@@ -412,73 +580,48 @@ def detect_minutiae(
     if h < 32 or w < 32:
         return _empty_result()
 
-    # Work on a cleaned skeleton. This also protects callers that
-    # invoke detect_minutiae directly rather than through analyze_minutiae.
+    period = float(ridge_spacing) if ridge_spacing else 10.0 * max(
+        0.75, min(h, w) / 512.0
+    )
+    period = float(np.clip(period, 4.0, 25.0))
+
     cleaned = skeleton.copy().astype(bool)
     cleaned[mask == 0] = False
 
     cleaned = _remove_boundary_skeleton(
-        cleaned,
-        mask,
-        boundary_margin=6,
+        cleaned, mask, boundary_margin=max(4, int(round(0.6 * period)))
     )
 
     cleaned = _prune_short_spurs(
         cleaned,
-        min_branch_length=8,
-        iterations=3,
+        min_branch_length=max(6, int(round(0.8 * period))),
+        iterations=2,
     )
 
-    neighbors = neighbor_count_map(cleaned)
+    cn_map = crossing_number_map(cleaned)
 
-    # Scale thresholds for different image resolutions.
-    scale = max(
-        0.75,
-        min(h, w) / 512.0,
-    )
-
-    # Stay well inside the image and foreground.
-    image_border = max(
-        12,
-        int(round(16 * scale)),
-    )
-
-    # A candidate must be this far inside the actual fingerprint mask.
-    mask_margin = max(
-        6,
-        int(round(8 * scale)),
-    )
-
-    support_radius = max(
-        8,
-        int(round(12 * scale)),
-    )
-
-    min_support = max(
-        10,
-        int(round(12 * scale)),
-    )
-
-    min_distance = max(
-        8,
-        int(round(12 * scale)),
-    )
-
-    # Conservative coherence threshold.
-    coherence_threshold = 0.45
+    image_border = max(8, int(round(1.2 * period)))
+    mask_margin = max(6, int(round(1.0 * period)))
+    support_radius = max(8, int(round(1.2 * period)))
+    min_support = max(10, int(round(1.2 * period)))
+    min_distance = max(6, int(round(0.8 * period)))
+    coherence_threshold = 0.30
 
     mask_distance = _distance_to_mask_boundary(mask)
 
-    endings = []
-    bifurcations = []
+    junctions = (cn_map >= 3).astype(np.uint8)
+    junction_density = cv2.filter2D(
+        junctions, -1, np.ones((9, 9), dtype=np.uint8)
+    )
 
-    skeleton_y, skeleton_x = np.where(cleaned)
+    candidates = []
 
-    for y, x in zip(skeleton_y, skeleton_x):
+    ys, xs = np.where((cn_map == 1) | (cn_map == 3))
+
+    for y, x in zip(ys, xs):
         y = int(y)
         x = int(x)
 
-        # Image-boundary rejection.
         if (
             x < image_border
             or y < image_border
@@ -487,90 +630,34 @@ def detect_minutiae(
         ):
             continue
 
-        # Foreground and segmentation-boundary rejection.
-        if mask[y, x] == 0:
+        if mask[y, x] == 0 or mask_distance[y, x] < mask_margin:
             continue
 
-        if mask_distance[y, x] < mask_margin:
-            continue
+        minutia_type = "ridge_ending" if cn_map[y, x] == 1 else "bifurcation"
 
-        neighbor_count = int(neighbors[y, x])
-
-        # Only accept exact CN-compatible skeleton structures.
-        if neighbor_count not in (1, 3):
-            continue
-
-        y1 = max(0, y - 1)
-        y2 = min(h, y + 2)
-        x1 = max(0, x - 1)
-        x2 = min(w, x + 2)
-
-        neighborhood = cleaned[y1:y2, x1:x2]
-
-        # CN requires a complete 3x3 neighbourhood.
-        if neighborhood.shape != (3, 3):
-            continue
-
-        cn = _crossing_number(neighborhood)
-
-        if cn == 1:
-            minutia_type = "ridge_ending"
-        elif cn == 3:
-            minutia_type = "bifurcation"
-        else:
-            continue
-
-        support = local_ridge_support(
-            cleaned,
-            y,
-            x,
-            radius=support_radius,
-        )
+        support = local_ridge_support(cleaned, y, x, radius=support_radius)
 
         if support < min_support:
             continue
 
-        local_coherence = _local_coherence(
-            coherence,
-            y,
-            x,
-            radius=4,
-        )
+        local_coherence = _local_coherence(coherence, y, x, radius=4)
 
         if local_coherence < coherence_threshold:
             continue
 
-        # Reject candidates where the local skeleton is implausibly
-        # sparse or dominated by branching noise.
-        local_neighbors = neighbors[
-            max(0, y - 4):min(h, y + 5),
-            max(0, x - 4):min(w, x + 5),
-        ]
-
-        local_branch_pixels = int(
-            np.count_nonzero(local_neighbors >= 3)
-        )
-
-        if local_branch_pixels > 18:
+        if int(junction_density[y, x]) > 4:
             continue
 
-        # Confidence is based on measurable properties only.
         support_score = float(
             np.clip(
-                (support - min_support)
-                / max(1.0, 40.0 * scale - min_support),
+                (support - min_support) / max(1.0, 4.0 * period - min_support),
                 0.0,
                 1.0,
             )
         )
 
         distance_score = float(
-            np.clip(
-                mask_distance[y, x]
-                / max(1.0, 20.0 * scale),
-                0.0,
-                1.0,
-            )
+            np.clip(mask_distance[y, x] / (2.0 * period), 0.0, 1.0)
         )
 
         confidence = float(
@@ -585,124 +672,76 @@ def detect_minutiae(
 
         theta = orientation[y, x]
 
-        if np.isfinite(theta):
-            theta = float(theta)
-        else:
-            theta = None
-
-        point = {
-            "x": x,
-            "y": y,
-            "type": minutia_type,
-            "support": support,
-            "coherence": local_coherence,
-            "confidence": confidence,
-            "orientation": theta,
-        }
-
-        if minutia_type == "ridge_ending":
-            endings.append(point)
-        else:
-            bifurcations.append(point)
-
-    # Remove nearby duplicates.
-    endings = cluster_points(
-        endings,
-        min_distance=min_distance,
-    )
-
-    bifurcations = cluster_points(
-        bifurcations,
-        min_distance=min_distance,
-    )
-
-    # Also suppress an ending and bifurcation that represent the same
-    # local artifact.
-    all_candidates = cluster_points(
-        endings + bifurcations,
-        min_distance=min_distance,
-    )
-
-    endings = [
-        point
-        for point in all_candidates
-        if point["type"] == "ridge_ending"
-    ]
-
-    bifurcations = [
-        point
-        for point in all_candidates
-        if point["type"] == "bifurcation"
-    ]
-
-    points = []
-
-    for point in all_candidates:
-        points.append(
+        candidates.append(
             {
-                "x": int(point["x"]),
-                "y": int(point["y"]),
-                "type": point["type"],
-                "orientation": (
-                    float(point["orientation"])
-                    if point["orientation"] is not None
-                    else None
-                ),
-                "confidence": float(
-                    np.clip(
-                        point["confidence"],
-                        0.0,
-                        1.0,
-                    )
-                ),
+                "x": x,
+                "y": y,
+                "type": minutia_type,
+                "support": support,
+                "coherence": local_coherence,
+                "confidence": confidence,
+                "orientation": float(theta) if np.isfinite(theta) else None,
             }
         )
 
-    # --------------------------------------------------------
-    # Global sanity checks
-    # --------------------------------------------------------
+    candidates = cluster_points(candidates, min_distance=min_distance)
 
-    skeleton_pixels = int(np.count_nonzero(cleaned))
-    point_count = len(points)
+    for point in candidates:
+        point["angle"] = _minutia_angle(
+            cleaned, point["y"], point["x"], point["type"]
+        )
 
-    if skeleton_pixels == 0:
-        return _empty_result()
+    candidates = _remove_spurious_pairs(candidates, period)
 
-    point_density = point_count / float(skeleton_pixels)
-
-    # Fingerprint minutiae should be sparse relative to the complete
-    # skeleton. Extremely dense detections indicate threshold/skeleton
-    # artifacts rather than genuine minutiae.
-    density_limit = 0.025
-
-    # Avoid accepting a tiny number of weak points as a meaningful
-    # detector result.
-    confidence_values = [
-        point["confidence"]
-        for point in points
+    points = [
+        {
+            "x": int(p["x"]),
+            "y": int(p["y"]),
+            "type": p["type"],
+            "orientation": p["orientation"],
+            "angle": p["angle"],
+            "confidence": float(np.clip(p["confidence"], 0.0, 1.0)),
+        }
+        for p in candidates
     ]
 
-    mean_confidence = (
-        float(np.mean(confidence_values))
-        if confidence_values
-        else 0.0
-    )
+    endings = [p for p in points if p["type"] == "ridge_ending"]
+    bifurcations = [p for p in points if p["type"] == "bifurcation"]
 
-    reliable = bool(
-        2 <= point_count <= 120
-        and point_density <= density_limit
-        and mean_confidence >= 0.55
-    )
+    skeleton_pixels = int(np.count_nonzero(cleaned))
 
-    if not reliable:
-        return _empty_result()
+    if skeleton_pixels == 0 or not points:
+        result = _empty_result()
+        result["reasons"] = ["no_minutiae_found"]
+        return result
+
+    reasons = []
+
+    point_density = len(points) / float(skeleton_pixels)
+    mean_confidence = float(np.mean([p["confidence"] for p in points]))
+
+    ratio = len(endings) / max(1, len(bifurcations))
+
+    if len(points) < 8:
+        reasons.append("too_few_minutiae")
+
+    if point_density > 0.04:
+        reasons.append("minutiae_density_too_high_noisy_skeleton")
+
+    if mean_confidence < 0.50:
+        reasons.append("low_mean_confidence")
+
+    if ratio > 6.0 or ratio < 1.0 / 6.0:
+        reasons.append("implausible_ending_to_bifurcation_ratio")
 
     return {
-        "total": int(point_count),
+        "total": int(len(points)),
         "ridge_endings": int(len(endings)),
         "bifurcations": int(len(bifurcations)),
         "points": points,
-        "reliable": True,
+        "reliable": len(reasons) == 0,
+        "reasons": reasons,
+        "mean_confidence": mean_confidence,
     }
 
 
@@ -715,6 +754,7 @@ def analyze_minutiae(
     mask,
     orientation,
     coherence,
+    ridge_spacing=None,
 ):
     """
     Complete minutiae-processing pipeline.
@@ -737,6 +777,7 @@ def analyze_minutiae(
         mask=mask,
         orientation=orientation,
         coherence=coherence,
+        ridge_spacing=ridge_spacing,
     )
 
     return {

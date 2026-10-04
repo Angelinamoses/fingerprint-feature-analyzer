@@ -23,12 +23,20 @@ from processing.density import (
     estimate_ridge_density,
 )
 
+from processing.enhancement import (
+    gabor_enhance,
+)
+
 from processing.quality import (
     assess_image_quality,
 )
 
 from processing.pattern import (
     analyze_pattern,
+)
+
+from processing.classifier import (
+    predict_pattern,
 )
 
 from processing.minutiae import (
@@ -160,7 +168,7 @@ def analyze_fingerprint(image):
 
     mask, segmented = (
         segment_fingerprint(
-            enhanced
+            denoised
         )
     )
 
@@ -191,9 +199,13 @@ def analyze_fingerprint(image):
     # 4. Orientation estimation
     # ========================================================
 
+    # Ridge orientation from the UNMASKED denoised image (a masked
+    # image has an artificial gradient along the mask border); the
+    # mask is applied inside the estimator.
     orientation, coherence = (
         estimate_orientation(
-            segmented
+            denoised,
+            mask=mask,
         )
     )
 
@@ -232,7 +244,10 @@ def analyze_fingerprint(image):
         spacing,
         frequency_results,
     ) = estimate_ridge_frequency(
-        segmented
+        denoised,
+        orientation=orientation,
+        mask=mask,
+        coherence=coherence,
     )
 
     # ========================================================
@@ -243,7 +258,21 @@ def analyze_fingerprint(image):
         density,
         density_results,
     ) = estimate_ridge_density(
-        segmented
+        denoised,
+        orientation=orientation,
+        mask=mask,
+        coherence=coherence,
+    )
+
+    # ========================================================
+    # 6b. Gabor ridge enhancement (used for minutiae)
+    # ========================================================
+
+    gabor, gabor_response = gabor_enhance(
+        denoised,
+        orientation,
+        frequency,
+        mask,
     )
 
     # ========================================================
@@ -258,15 +287,32 @@ def analyze_fingerprint(image):
         block_size=16,
     )
 
+    # Optional learned classifier (models/pattern_svm.joblib).
+    # When present and confident it decides the label; the
+    # singular-point evidence is kept for transparency.
+    learned = predict_pattern(gray)
+
+    if learned is not None:
+        rule_based = pattern_results["pattern"]
+        pattern_results["pattern"] = {
+            **learned,
+            "subtype": rule_based.get("subtype"),
+            "evidence": {
+                **(rule_based.get("evidence") or {}),
+                "rule_based_label": rule_based.get("label"),
+            },
+        }
+
     # ========================================================
     # 8. Minutiae analysis
     # ========================================================
 
     minutiae_results = analyze_minutiae(
-        image=enhanced,
+        image=gabor,
         mask=mask,
         orientation=orientation,
         coherence=coherence,
+        ridge_spacing=spacing,
     )
 
     # ========================================================
@@ -320,6 +366,7 @@ def analyze_fingerprint(image):
             "normalized": normalized,
             "denoised": denoised,
             "enhanced": enhanced,
+            "gabor": gabor,
         },
 
         "segmentation": {

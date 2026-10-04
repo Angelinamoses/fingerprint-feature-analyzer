@@ -78,6 +78,7 @@ def _extract_point(point):
         "y": y,
         "type": point_type,
         "orientation": orientation,
+        "angle": _safe_float(point.get("angle")),
         "confidence": confidence,
     }
 
@@ -136,16 +137,10 @@ def _extract_minutiae(results):
         detector.get("bifurcations")
     )
 
-    # Never report counts if the detector explicitly
-    # marked its result as unreliable.
-    if not reliable:
-        return {
-            "total": None,
-            "ridge_endings": None,
-            "bifurcations": None,
-            "points": [],
-            "reliable": False,
-        }
+    # Points are reported even when the global sanity checks flag
+    # the result; ``reliable`` / ``reasons`` tell the consumer how far
+    # to trust it (the old code blanked everything, hiding real data).
+    reasons = detector.get("reasons", [])
 
     # Recalculate total from the actual returned points
     # when possible. This prevents inconsistent counts.
@@ -169,7 +164,8 @@ def _extract_minutiae(results):
         "ridge_endings": ridge_endings,
         "bifurcations": bifurcations,
         "points": points,
-        "reliable": True,
+        "reliable": reliable,
+        "reasons": list(reasons) if isinstance(reasons, list) else [],
     }
 
 
@@ -253,6 +249,19 @@ def _extract_singular_point(results, name):
         "x": x,
         "y": y,
         "confidence": confidence,
+    }
+
+
+def _extract_pattern_details(results):
+    pattern_result = results.get("pattern")
+
+    if not isinstance(pattern_result, dict):
+        return {"confidence": None, "method": None, "subtype": None}
+
+    return {
+        "confidence": _safe_float(pattern_result.get("confidence")),
+        "method": pattern_result.get("method"),
+        "subtype": pattern_result.get("subtype"),
     }
 
 
@@ -413,9 +422,11 @@ def extract_features(results):
             )
 
             if valid_orientation.size > 0:
+                # orientation has period pi -> circular mean,
+                # not an arithmetic median
                 ridge_orientation = float(
-                    np.median(
-                        valid_orientation
+                    0.5 * np.angle(
+                        np.mean(np.exp(2j * valid_orientation))
                     )
                 )
 
@@ -543,6 +554,8 @@ def extract_features(results):
 
     features = {
         "pattern_type": pattern_type,
+
+        "pattern_details": _extract_pattern_details(results),
 
         "image_quality": image_quality,
 

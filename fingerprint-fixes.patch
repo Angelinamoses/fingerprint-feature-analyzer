@@ -1,0 +1,3204 @@
+diff --git a/backend/main.py b/backend/main.py
+index 506ef09..74fb8e6 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -183,6 +183,11 @@ async def analyze_fingerprint_endpoint(
+                     "pattern_type"
+                 ],
+ 
++            "pattern_details":
++                features[
++                    "pattern_details"
++                ],
++
+             "image_quality":
+                 features[
+                     "image_quality"
+diff --git a/processing/classifier.py b/processing/classifier.py
+new file mode 100644
+index 0000000..cc78294
+--- /dev/null
++++ b/processing/classifier.py
+@@ -0,0 +1,77 @@
++"""
++Optional learned pattern classifier (HOG + RBF-SVM).
++
++The repository's own notebook (03_segmentation_experiments) trained
++this model (89.6 % hold-out, and it labelled class1_Arc_0001 as Arc
++with p = 0.977), but it was never moved into ``processing/``, so the
++API only had the singular-point heuristic.
++
++Train with:   python scripts/train_pattern_classifier.py
++The model is loaded from  models/pattern_svm.joblib  if it exists.
++"""
++
++import os
++
++import cv2
++import numpy as np
++
++MODEL_PATH = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++    "models",
++    "pattern_svm.joblib",
++)
++
++_MODEL = {"loaded": False, "model": None}
++
++
++def hog_features(gray, size=(128, 128)):
++    from skimage.feature import hog
++
++    img = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
++    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
++
++    return hog(
++        img,
++        orientations=9,
++        pixels_per_cell=(8, 8),
++        cells_per_block=(2, 2),
++        block_norm="L2-Hys",
++    )
++
++
++def load_model(path=MODEL_PATH):
++    if _MODEL["loaded"]:
++        return _MODEL["model"]
++
++    _MODEL["loaded"] = True
++
++    if os.path.exists(path):
++        import joblib
++
++        _MODEL["model"] = joblib.load(path)
++
++    return _MODEL["model"]
++
++
++def predict_pattern(gray, min_confidence=0.60):
++    """
++    Returns {"label", "confidence", "method"} or None when no model
++    is available / the prediction is not confident enough.
++    """
++    model = load_model()
++
++    if model is None:
++        return None
++
++    probabilities = model.predict_proba([hog_features(gray)])[0]
++    index = int(np.argmax(probabilities))
++    confidence = float(probabilities[index])
++
++    if confidence < min_confidence:
++        return None
++
++    return {
++        "label": str(model.classes_[index]).capitalize().replace("Arc", "Arch"),
++        "confidence": confidence,
++        "method": "hog_rbf_svm",
++    }
+diff --git a/processing/density.py b/processing/density.py
+index ded4b93..2565cbe 100644
+--- a/processing/density.py
++++ b/processing/density.py
+@@ -1,50 +1,43 @@
+ import numpy as np
+-from scipy.signal import find_peaks
++
++from processing.frequency import estimate_ridge_frequency
+ 
+ 
+ def estimate_ridge_density(
+     image,
+-    rows=None,
+-    min_peak_distance=5,
+-    prominence=20
++    orientation=None,
++    mask=None,
++    coherence=None,
++    **kwargs,
+ ):
+     """
+-    Estimate ridge density from multiple horizontal
+-    fingerprint profiles.
+-
+-    Returns:
+-        density: robust median ridge density
+-        densities: individual row density estimates
+-    """
+-
+-    if rows is None:
+-        height = image.shape[0]
+-        rows = np.linspace(
+-            height * 0.25,
+-            height * 0.75,
+-            8
+-        ).astype(int)
++    Ridge density = number of ridges per pixel measured ACROSS the ridges.
+ 
+-    densities = []
++    The original implementation counted intensity peaks along a few
++    horizontal rows and divided by the image width. That mixes in the
++    local ridge direction (oblique ridges are crossed more rarely per
++    pixel along the row than perpendicular ones) and counts peaks over
++    the whole row width, including background.
+ 
+-    for y in rows:
+-        profile = image[y, :].astype(np.float32)
++    The estimate now comes from the same oriented-profile estimator
++    used for ridge frequency, so density (ridges/pixel) is consistent
++    with frequency and spacing. Multiply by pixels-per-mm
++    (19.69 for 500 dpi) to get ridges/mm.
+ 
+-        peaks, _ = find_peaks(
+-            profile,
+-            distance=min_peak_distance,
+-            prominence=prominence
+-        )
+-
+-        if len(peaks) < 5:
+-            continue
+-
+-        density = len(peaks) / image.shape[1]
+-        densities.append(density)
++    Returns:
++        density:   median ridges/pixel (or None)
++        densities: per-location estimates (np.ndarray)
++    """
+ 
+-    if not densities:
+-        return None, []
++    frequency, _, estimates = estimate_ridge_frequency(
++        image,
++        orientation=orientation,
++        mask=mask,
++        coherence=coherence,
++        **kwargs,
++    )
+ 
+-    density = np.median(densities)
++    if frequency is None:
++        return None, np.array([])
+ 
+-    return density, np.array(densities)
+\ No newline at end of file
++    return float(np.median(estimates)), np.asarray(estimates)
+diff --git a/processing/enhancement.py b/processing/enhancement.py
+index e69de29..bc74125 100644
+--- a/processing/enhancement.py
++++ b/processing/enhancement.py
+@@ -0,0 +1,132 @@
++"""
++Oriented Gabor ridge enhancement (Hong, Wan & Jain style).
++
++This file was empty in the original repository, so ridges were
++binarised straight from a CLAHE image. Without ridge-oriented
++filtering, adaptive thresholding yields broken ridges, bridges and
++spurs, and the skeleton produces mostly false minutiae.
++"""
++
++import cv2
++import numpy as np
++
++
++def _gabor_kernel(phi, period, sigma_n, sigma_a, size):
++    """
++    Even-symmetric Gabor kernel.
++
++    phi:     direction of the ridge NORMAL (the modulation direction)
++    sigma_n: Gaussian sigma across the ridge
++    sigma_a: Gaussian sigma along the ridge
++    """
++    half = size // 2
++    ys, xs = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float32)
++
++    across = xs * np.cos(phi) + ys * np.sin(phi)
++    along = -xs * np.sin(phi) + ys * np.cos(phi)
++
++    kernel = np.exp(
++        -(across ** 2) / (2.0 * sigma_n ** 2)
++        - (along ** 2) / (2.0 * sigma_a ** 2)
++    ) * np.cos(2.0 * np.pi * across / period)
++
++    return kernel - kernel.mean()
++
++
++def gabor_enhance(
++    image,
++    orientation,
++    frequency=None,
++    mask=None,
++    n_orientations=16,
++    sigma_n_factor=0.45,
++    sigma_a_factor=0.9,
++    ridge_polarity="dark",
++):
++    """
++    Enhance ridges with an oriented Gabor filter bank.
++
++    Args:
++        image:       Grayscale image (uint8 / float).
++        orientation: Ridge orientation map (radians, period pi).
++        frequency:   Ridge frequency in cycles/pixel (None -> 0.1).
++        mask:        Foreground mask.
++        n_orientations: number of discrete filter orientations.
++        sigma_n_factor / sigma_a_factor:
++            Gaussian envelope sigmas as a fraction of the ridge period.
++        ridge_polarity:
++            "dark" (ink ridges on light paper, as in NIST SD4) or
++            "bright".
++
++    Returns:
++        enhanced: uint8 image, dark ridges on a mid-grey (128)
++                  background, zero outside the mask -> 255.
++        response: float32 filter response (positive on ridges).
++    """
++
++    img = image.astype(np.float32)
++
++    if frequency is None or not np.isfinite(frequency) or frequency <= 0:
++        frequency = 0.1
++
++    period = float(np.clip(1.0 / frequency, 4.0, 25.0))
++
++    inside = (mask > 0) if mask is not None else np.ones(img.shape, bool)
++
++    # --- normalise: z-score inside the print, then remove slow
++    #     illumination variation
++    if np.any(inside):
++        mu = float(img[inside].mean())
++        sd = float(img[inside].std()) + 1e-6
++    else:
++        mu, sd = float(img.mean()), float(img.std()) + 1e-6
++
++    z = (img - mu) / sd
++    z[~inside] = 0.0
++
++    weights = inside.astype(np.float32)
++    sigma_bg = 2.0 * period
++    background = cv2.GaussianBlur(z * weights, (0, 0), sigma_bg)
++    background /= cv2.GaussianBlur(weights, (0, 0), sigma_bg) + 1e-6
++    z = (z - background) * weights
++
++    if ridge_polarity == "dark":
++        z = -z                      # make ridges positive
++
++    # --- filter bank
++    size = int(round(period * 4.5)) | 1
++    sigma_n = sigma_n_factor * period
++    sigma_a = sigma_a_factor * period
++
++    kernels = [
++        _gabor_kernel(
++            b * np.pi / n_orientations + np.pi / 2.0,
++            period,
++            sigma_n,
++            sigma_a,
++            size,
++        )
++        for b in range(n_orientations)
++    ]
++
++    bank = np.stack([cv2.filter2D(z, -1, k) for k in kernels], axis=0)
++
++    theta = np.mod(np.nan_to_num(orientation, nan=0.0), np.pi)
++    position = theta / np.pi * n_orientations
++    lower = np.floor(position).astype(np.int64) % n_orientations
++    upper = (lower + 1) % n_orientations
++    weight_upper = (position - np.floor(position)).astype(np.float32)
++
++    r_lower = np.take_along_axis(bank, lower[None], axis=0)[0]
++    r_upper = np.take_along_axis(bank, upper[None], axis=0)[0]
++
++    response = ((1.0 - weight_upper) * r_lower + weight_upper * r_upper)
++    response = response.astype(np.float32)
++    response[~inside] = 0.0
++
++    scale = float(np.std(response[inside])) + 1e-6 if np.any(inside) else 1.0
++
++    enhanced = np.clip(128.0 - 55.0 * response / scale, 0, 255)
++    enhanced[~inside] = 255.0
++
++    return enhanced.astype(np.uint8), response
+diff --git a/processing/features.py b/processing/features.py
+index d8408b1..d0275cc 100644
+--- a/processing/features.py
++++ b/processing/features.py
+@@ -78,6 +78,7 @@ def _extract_point(point):
+         "y": y,
+         "type": point_type,
+         "orientation": orientation,
++        "angle": _safe_float(point.get("angle")),
+         "confidence": confidence,
+     }
+ 
+@@ -136,16 +137,10 @@ def _extract_minutiae(results):
+         detector.get("bifurcations")
+     )
+ 
+-    # Never report counts if the detector explicitly
+-    # marked its result as unreliable.
+-    if not reliable:
+-        return {
+-            "total": None,
+-            "ridge_endings": None,
+-            "bifurcations": None,
+-            "points": [],
+-            "reliable": False,
+-        }
++    # Points are reported even when the global sanity checks flag
++    # the result; ``reliable`` / ``reasons`` tell the consumer how far
++    # to trust it (the old code blanked everything, hiding real data).
++    reasons = detector.get("reasons", [])
+ 
+     # Recalculate total from the actual returned points
+     # when possible. This prevents inconsistent counts.
+@@ -169,7 +164,8 @@ def _extract_minutiae(results):
+         "ridge_endings": ridge_endings,
+         "bifurcations": bifurcations,
+         "points": points,
+-        "reliable": True,
++        "reliable": reliable,
++        "reasons": list(reasons) if isinstance(reasons, list) else [],
+     }
+ 
+ 
+@@ -256,6 +252,19 @@ def _extract_singular_point(results, name):
+     }
+ 
+ 
++def _extract_pattern_details(results):
++    pattern_result = results.get("pattern")
++
++    if not isinstance(pattern_result, dict):
++        return {"confidence": None, "method": None, "subtype": None}
++
++    return {
++        "confidence": _safe_float(pattern_result.get("confidence")),
++        "method": pattern_result.get("method"),
++        "subtype": pattern_result.get("subtype"),
++    }
++
++
+ def _extract_pattern(results):
+     """
+     Extract pattern classification from the pipeline.
+@@ -413,9 +422,11 @@ def extract_features(results):
+             )
+ 
+             if valid_orientation.size > 0:
++                # orientation has period pi -> circular mean,
++                # not an arithmetic median
+                 ridge_orientation = float(
+-                    np.median(
+-                        valid_orientation
++                    0.5 * np.angle(
++                        np.mean(np.exp(2j * valid_orientation))
+                     )
+                 )
+ 
+@@ -544,6 +555,8 @@ def extract_features(results):
+     features = {
+         "pattern_type": pattern_type,
+ 
++        "pattern_details": _extract_pattern_details(results),
++
+         "image_quality": image_quality,
+ 
+         "core": core,
+diff --git a/processing/frequency.py b/processing/frequency.py
+index 7c6cdad..ed100b0 100644
+--- a/processing/frequency.py
++++ b/processing/frequency.py
+@@ -1,57 +1,170 @@
++import cv2
+ import numpy as np
+-from scipy.signal import find_peaks
++from scipy.ndimage import map_coordinates
++
++from processing.orientation import estimate_orientation
++
++
++def _normal_signature(image, cx, cy, theta, length, width):
++    """
++    Average the image along the ridge direction and return the 1-D
++    profile ACROSS the ridges ("x-signature").
++
++    theta is the ridge orientation, so the sampling axis is the ridge
++    normal.
++    """
++    tx, ty = np.cos(theta), np.sin(theta)       # along the ridge
++    nx, ny = -np.sin(theta), np.cos(theta)      # across the ridge
++
++    u = np.arange(length, dtype=np.float32) - (length - 1) / 2.0
++    v = np.arange(width, dtype=np.float32) - (width - 1) / 2.0
++
++    U, V = np.meshgrid(u, v)
++
++    xs = cx + U * nx + V * tx
++    ys = cy + U * ny + V * ty
++
++    patch = map_coordinates(
++        image,
++        [ys, xs],
++        order=1,
++        mode="nearest",
++    )
++
++    return patch.mean(axis=0)
++
++
++def _dominant_frequency(signature, min_freq, max_freq, min_peak_ratio):
++    """
++    Dominant spatial frequency (cycles / pixel) of a 1-D ridge
++    profile via a windowed, zero-padded FFT.
++
++    Returns None when no clear periodic component exists.
++    """
++    s = signature - signature.mean()
++
++    if np.std(s) < 1e-3:
++        return None
++
++    s = s * np.hanning(len(s))
++
++    n_fft = 512
++    spectrum = np.abs(np.fft.rfft(s, n=n_fft))
++    freqs = np.fft.rfftfreq(n_fft, d=1.0)
++
++    band = (freqs >= min_freq) & (freqs <= max_freq)
++
++    if not np.any(band):
++        return None
++
++    band_spectrum = spectrum[band]
++    band_freqs = freqs[band]
++
++    peak_index = int(np.argmax(band_spectrum))
++    peak = band_spectrum[peak_index]
++
++    if peak < min_peak_ratio * (np.median(band_spectrum) + 1e-9):
++        return None
++
++    return float(band_freqs[peak_index])
+ 
+ 
+ def estimate_ridge_frequency(
+     image,
+-    rows=None,
+-    min_peak_distance=5,
+-    prominence=20
++    orientation=None,
++    mask=None,
++    coherence=None,
++    window_length=48,
++    window_width=16,
++    step=24,
++    min_period=4.0,
++    max_period=25.0,
++    min_coherence=0.40,
++    min_peak_ratio=3.0,
+ ):
+     """
+-    Estimate fingerprint ridge frequency from multiple
+-    horizontal intensity profiles.
++    Estimate ridge frequency from many oriented, local ridge profiles.
++
++    The original estimator used 8 *horizontal* intensity rows. A
++    horizontal line crosses oblique ridges at a stretched distance
++    (period / sin(angle)), so spacing was overestimated and depended
++    on the ridge direction (e.g. 15.5 px reported where the true
++    period was ~10-12 px). Here the profile is taken along the ridge
++    NORMAL at many locations, so the result is independent of the
++    local ridge direction.
++
++    Args:
++        image:       Grayscale image (denoised, not masked).
++        orientation: Ridge orientation map (radians). Computed if None.
++        mask:        Foreground mask.
++        coherence:   Orientation coherence (computed if orientation is None).
+ 
+     Returns:
+-        frequency: robust median frequency in cycles/pixel
+-        spacing: robust median ridge spacing in pixels
+-        frequencies: individual valid row estimates
++        frequency: median frequency in cycles/pixel (or None)
++        spacing:   median ridge period in pixels (or None)
++        estimates: per-location frequency estimates (np.ndarray)
+     """
+ 
+-    if rows is None:
+-        height = image.shape[0]
+-        rows = np.linspace(
+-            height * 0.25,
+-            height * 0.75,
+-            8
+-        ).astype(int)
++    img = image.astype(np.float32)
++
++    if orientation is None:
++        orientation, coherence = estimate_orientation(
++            img,
++            mask=mask,
++        )
+ 
+-    frequencies = []
++    height, width = img.shape[:2]
+ 
+-    for y in rows:
+-        profile = image[y, :].astype(np.float32)
++    if mask is not None:
++        inside = (mask > 0).astype(np.uint8)
++        distance = cv2.distanceTransform(inside, cv2.DIST_L2, 3)
++    else:
++        distance = np.full((height, width), 1e6, dtype=np.float32)
+ 
+-        peaks, _ = find_peaks(
+-            profile,
+-            distance=min_peak_distance,
+-            prominence=prominence
+-        )
++    margin = window_length / 2.0 + 2.0
++
++    estimates = []
++
++    for cy in range(int(margin), int(height - margin), step):
++
++        for cx in range(int(margin), int(width - margin), step):
++
++            if distance[cy, cx] < margin:
++                continue
++
++            if coherence is not None and coherence[cy, cx] < min_coherence:
++                continue
++
++            theta = float(orientation[cy, cx])
++
++            if not np.isfinite(theta):
++                continue
+ 
+-        if len(peaks) < 5:
+-            continue
++            signature = _normal_signature(
++                img,
++                cx,
++                cy,
++                theta,
++                window_length,
++                window_width,
++            )
+ 
+-        spacing = np.diff(peaks)
+-        median_spacing = np.median(spacing)
++            freq = _dominant_frequency(
++                signature,
++                1.0 / max_period,
++                1.0 / min_period,
++                min_peak_ratio,
++            )
+ 
+-        if median_spacing > 0:
+-            frequencies.append(1.0 / median_spacing)
++            if freq is not None:
++                estimates.append(freq)
+ 
+-    if not frequencies:
+-        return None, None, []
++    if len(estimates) < 3:
++        return None, None, np.array([])
+ 
+-    frequencies = np.array(frequencies)
++    estimates = np.asarray(estimates, dtype=np.float64)
+ 
+-    frequency = np.median(frequencies)
++    frequency = float(np.median(estimates))
+     spacing = 1.0 / frequency
+ 
+-    return frequency, spacing, frequencies
+\ No newline at end of file
++    return frequency, spacing, estimates
+diff --git a/processing/minutiae.py b/processing/minutiae.py
+index fc2b802..3b43c63 100644
+--- a/processing/minutiae.py
++++ b/processing/minutiae.py
+@@ -14,27 +14,52 @@ def _empty_result():
+         "bifurcations": None,
+         "points": [],
+         "reliable": False,
++        "reasons": ["detector_unavailable"],
+     }
+ 
+ 
+ def _crossing_number(neighborhood):
+     """
+-    Crossing Number (CN) for an 8-neighbourhood.
+-
+-    CN = 1 -> ridge ending
+-    CN = 3 -> bifurcation
++    Crossing Number (CN) of the centre pixel of a 3x3 neighbourhood.
++
++        CN = 1 -> ridge ending,  CN = 3 -> bifurcation
++
++    BUG FIXED: the original built the ring as
++    [p0, p1, p2, p5, p3, p4, p6, p7, p0] from the flattened 3x3 block.
++    That order is not a walk around the centre (it visits the centre
++    pixel p4 and skips p8), so CN was wrong for most configurations:
++    only ~3/8 true ending patterns and ~8/16 true bifurcation
++    patterns were recognised, and several non-minutia staircase
++    patterns were accepted. The correct clockwise ring is
++    p0, p1, p2, p5, p8, p7, p6, p3.
+     """
+-    p = neighborhood.flatten().astype(np.uint8)
++    p = np.asarray(neighborhood).flatten().astype(np.int16)
++
++    ring = [p[0], p[1], p[2], p[5], p[8], p[7], p[6], p[3], p[0]]
++
++    return int(sum(abs(ring[i + 1] - ring[i]) for i in range(8)) // 2)
++
++
++def crossing_number_map(skeleton):
++    """Vectorised crossing number for every skeleton pixel (0 elsewhere)."""
++    sk = np.pad(skeleton.astype(np.int16), 1)
++
++    ring = [
++        sk[0:-2, 0:-2], sk[0:-2, 1:-1], sk[0:-2, 2:],
++        sk[1:-1, 2:],
++        sk[2:, 2:], sk[2:, 1:-1], sk[2:, 0:-2],
++        sk[1:-1, 0:-2],
++    ]
+ 
+-    # Clockwise order around the center pixel.
+-    ring = np.array([
+-        p[0], p[1], p[2],
+-        p[5],       p[3],
+-        p[4], p[6], p[7],
+-        p[0],
+-    ])
++    total = np.zeros(skeleton.shape, dtype=np.int16)
+ 
+-    return int(np.sum(np.abs(np.diff(ring.astype(np.int16)))) // 2)
++    for i in range(8):
++        total += np.abs(ring[i] - ring[(i + 1) % 8])
++
++    cn = total // 2
++    cn[~skeleton.astype(bool)] = 0
++
++    return cn
+ 
+ 
+ def _distance_to_mask_boundary(mask):
+@@ -372,27 +397,170 @@ def cluster_points(points, min_distance):
+ # Minutiae detection
+ # ============================================================
+ 
++def _trace_direction(skeleton, y, x, steps=10):
++    """
++    Walk along each skeleton branch leaving (y, x) for up to ``steps``
++    pixels. Returns a list of angles (radians, image coords, y down)
++    from the point to the end of every branch.
++    """
++    h, w = skeleton.shape
++    angles = []
++
++    starts = [
++        (y + dy, x + dx)
++        for dy in (-1, 0, 1)
++        for dx in (-1, 0, 1)
++        if (dy or dx)
++        and 0 <= y + dy < h
++        and 0 <= x + dx < w
++        and skeleton[y + dy, x + dx]
++    ]
++
++    for sy, sx in starts:
++        visited = {(y, x), (sy, sx)}
++        cy, cx = sy, sx
++
++        for _ in range(steps - 1):
++            nxt = None
++            for dy in (-1, 0, 1):
++                for dx in (-1, 0, 1):
++                    ny, nx = cy + dy, cx + dx
++                    if (
++                        (dy or dx)
++                        and 0 <= ny < h
++                        and 0 <= nx < w
++                        and skeleton[ny, nx]
++                        and (ny, nx) not in visited
++                        # do not cross into another branch of the
++                        # starting junction
++                        and max(abs(ny - y), abs(nx - x)) > 1
++                    ):
++                        nxt = (ny, nx)
++                        break
++                if nxt:
++                    break
++            if nxt is None:
++                break
++            visited.add(nxt)
++            cy, cx = nxt
++
++        if (cy, cx) != (y, x):
++            angles.append(float(np.arctan2(cy - y, cx - x)))
++
++    return angles
++
++
++def _minutia_angle(skeleton, y, x, minutia_type):
++    """
++    Minutia direction in [0, 2*pi) (image coordinates, y down).
++
++    ridge_ending: direction pointing from the ridge body OUT through
++                  the ending (away from the ridge).
++    bifurcation:  direction in which the two daughter branches open
++                  (opposite to the single stem).
++
++    Returns None if the local skeleton cannot be traced.
++    """
++    angles = _trace_direction(skeleton, y, x)
++
++    if minutia_type == "ridge_ending":
++        if not angles:
++            return None
++        return float((angles[0] + np.pi) % (2 * np.pi))
++
++    if len(angles) < 3:
++        return None
++
++    vectors = np.exp(1j * np.asarray(angles[:3]))
++
++    def separation(i):
++        others = [j for j in range(3) if j != i]
++        return min(
++            abs(np.angle(vectors[i] / vectors[j])) for j in others
++        )
++
++    stem = max(range(3), key=separation)
++    daughters = [j for j in range(3) if j != stem]
++
++    return float(np.angle(vectors[daughters].sum()) % (2 * np.pi))
++
++
++def _angle_difference(a, b):
++    return abs(float(np.angle(np.exp(1j * (a - b)))))
++
++
++def _remove_spurious_pairs(points, period):
++    """
++    Remove the classic false-minutiae signatures:
++
++      * two endings facing each other across a short gap (broken ridge)
++      * an ending next to a bifurcation (spur / bridge artefact)
++      * two bifurcations very close together (bridge)
++    """
++    drop = set()
++    gap = 1.3 * period
++    near = 0.8 * period
++
++    for i in range(len(points)):
++        for j in range(i + 1, len(points)):
++            a, b = points[i], points[j]
++            d = np.hypot(a["x"] - b["x"], a["y"] - b["y"])
++
++            if d > gap:
++                continue
++
++            both_ending = (
++                a["type"] == "ridge_ending" and b["type"] == "ridge_ending"
++            )
++
++            if both_ending:
++                if (
++                    a.get("angle") is not None
++                    and b.get("angle") is not None
++                ):
++                    if _angle_difference(a["angle"], b["angle"]) > 2.2:
++                        drop.update((i, j))
++                continue
++
++            if d <= near:
++                drop.update((i, j))
++
++    return [p for k, p in enumerate(points) if k not in drop]
++
++
+ def detect_minutiae(
+     skeleton,
+     mask,
+     orientation,
+     coherence,
++    ridge_spacing=None,
+ ):
+     """
+     Detect fingerprint ridge endings and bifurcations.
+ 
+-    Detection is deliberately conservative:
+-        - segmentation-boundary rejection
+-        - minimum distance from mask boundary
+-        - crossing-number classification
+-        - local ridge support
+-        - local orientation coherence
+-        - short-spur pruning
+-        - duplicate suppression
+-        - global sanity checks
+-
+-    If the resulting set is not trustworthy, the function returns
+-    reliable=False and does not fabricate feature counts.
++    Stages: boundary rejection, correct crossing-number
++    classification, local support, coherence, junction-noise test,
++    duplicate suppression, spurious-pair removal, true minutia
++    direction.
++
++    Changes relative to the original
++    --------------------------------
++    * Correct crossing number (see ``_crossing_number``).
++    * The "branching noise" test counted pixels with >= 3 skeleton
++      neighbours. Ordinary staircase pixels satisfy that, so it
++      rejected about half of all good candidates. It now counts real
++      junctions (CN >= 3).
++    * Distance thresholds scale with the measured ridge spacing
++      instead of image size.
++    * No more all-or-nothing discard. The original threw away EVERY
++      minutia when the count fell outside [2, 120], but a rolled
++      print legitimately has 100-200 minutiae, and the density /
++      confidence checks hid everything else. Points are always
++      returned; ``reliable`` and ``reasons`` describe the quality.
++    * ``angle`` is a real minutia direction (0..2*pi) traced along the
++      skeleton. The old ``orientation`` was the pi-periodic gradient
++      angle sampled at the pixel (perpendicular to the ridge).
++      ``orientation`` is now the ridge orientation at the point.
+     """
+     if skeleton is None or mask is None:
+         return _empty_result()
+@@ -412,73 +580,48 @@ def detect_minutiae(
+     if h < 32 or w < 32:
+         return _empty_result()
+ 
+-    # Work on a cleaned skeleton. This also protects callers that
+-    # invoke detect_minutiae directly rather than through analyze_minutiae.
++    period = float(ridge_spacing) if ridge_spacing else 10.0 * max(
++        0.75, min(h, w) / 512.0
++    )
++    period = float(np.clip(period, 4.0, 25.0))
++
+     cleaned = skeleton.copy().astype(bool)
+     cleaned[mask == 0] = False
+ 
+     cleaned = _remove_boundary_skeleton(
+-        cleaned,
+-        mask,
+-        boundary_margin=6,
++        cleaned, mask, boundary_margin=max(4, int(round(0.6 * period)))
+     )
+ 
+     cleaned = _prune_short_spurs(
+         cleaned,
+-        min_branch_length=8,
+-        iterations=3,
++        min_branch_length=max(6, int(round(0.8 * period))),
++        iterations=2,
+     )
+ 
+-    neighbors = neighbor_count_map(cleaned)
++    cn_map = crossing_number_map(cleaned)
+ 
+-    # Scale thresholds for different image resolutions.
+-    scale = max(
+-        0.75,
+-        min(h, w) / 512.0,
+-    )
++    image_border = max(8, int(round(1.2 * period)))
++    mask_margin = max(6, int(round(1.0 * period)))
++    support_radius = max(8, int(round(1.2 * period)))
++    min_support = max(10, int(round(1.2 * period)))
++    min_distance = max(6, int(round(0.8 * period)))
++    coherence_threshold = 0.30
+ 
+-    # Stay well inside the image and foreground.
+-    image_border = max(
+-        12,
+-        int(round(16 * scale)),
+-    )
+-
+-    # A candidate must be this far inside the actual fingerprint mask.
+-    mask_margin = max(
+-        6,
+-        int(round(8 * scale)),
+-    )
+-
+-    support_radius = max(
+-        8,
+-        int(round(12 * scale)),
+-    )
+-
+-    min_support = max(
+-        10,
+-        int(round(12 * scale)),
+-    )
++    mask_distance = _distance_to_mask_boundary(mask)
+ 
+-    min_distance = max(
+-        8,
+-        int(round(12 * scale)),
++    junctions = (cn_map >= 3).astype(np.uint8)
++    junction_density = cv2.filter2D(
++        junctions, -1, np.ones((9, 9), dtype=np.uint8)
+     )
+ 
+-    # Conservative coherence threshold.
+-    coherence_threshold = 0.45
+-
+-    mask_distance = _distance_to_mask_boundary(mask)
+-
+-    endings = []
+-    bifurcations = []
++    candidates = []
+ 
+-    skeleton_y, skeleton_x = np.where(cleaned)
++    ys, xs = np.where((cn_map == 1) | (cn_map == 3))
+ 
+-    for y, x in zip(skeleton_y, skeleton_x):
++    for y, x in zip(ys, xs):
+         y = int(y)
+         x = int(x)
+ 
+-        # Image-boundary rejection.
+         if (
+             x < image_border
+             or y < image_border
+@@ -487,90 +630,34 @@ def detect_minutiae(
+         ):
+             continue
+ 
+-        # Foreground and segmentation-boundary rejection.
+-        if mask[y, x] == 0:
++        if mask[y, x] == 0 or mask_distance[y, x] < mask_margin:
+             continue
+ 
+-        if mask_distance[y, x] < mask_margin:
+-            continue
+-
+-        neighbor_count = int(neighbors[y, x])
++        minutia_type = "ridge_ending" if cn_map[y, x] == 1 else "bifurcation"
+ 
+-        # Only accept exact CN-compatible skeleton structures.
+-        if neighbor_count not in (1, 3):
+-            continue
+-
+-        y1 = max(0, y - 1)
+-        y2 = min(h, y + 2)
+-        x1 = max(0, x - 1)
+-        x2 = min(w, x + 2)
+-
+-        neighborhood = cleaned[y1:y2, x1:x2]
+-
+-        # CN requires a complete 3x3 neighbourhood.
+-        if neighborhood.shape != (3, 3):
+-            continue
+-
+-        cn = _crossing_number(neighborhood)
+-
+-        if cn == 1:
+-            minutia_type = "ridge_ending"
+-        elif cn == 3:
+-            minutia_type = "bifurcation"
+-        else:
+-            continue
+-
+-        support = local_ridge_support(
+-            cleaned,
+-            y,
+-            x,
+-            radius=support_radius,
+-        )
++        support = local_ridge_support(cleaned, y, x, radius=support_radius)
+ 
+         if support < min_support:
+             continue
+ 
+-        local_coherence = _local_coherence(
+-            coherence,
+-            y,
+-            x,
+-            radius=4,
+-        )
++        local_coherence = _local_coherence(coherence, y, x, radius=4)
+ 
+         if local_coherence < coherence_threshold:
+             continue
+ 
+-        # Reject candidates where the local skeleton is implausibly
+-        # sparse or dominated by branching noise.
+-        local_neighbors = neighbors[
+-            max(0, y - 4):min(h, y + 5),
+-            max(0, x - 4):min(w, x + 5),
+-        ]
+-
+-        local_branch_pixels = int(
+-            np.count_nonzero(local_neighbors >= 3)
+-        )
+-
+-        if local_branch_pixels > 18:
++        if int(junction_density[y, x]) > 4:
+             continue
+ 
+-        # Confidence is based on measurable properties only.
+         support_score = float(
+             np.clip(
+-                (support - min_support)
+-                / max(1.0, 40.0 * scale - min_support),
++                (support - min_support) / max(1.0, 4.0 * period - min_support),
+                 0.0,
+                 1.0,
+             )
+         )
+ 
+         distance_score = float(
+-            np.clip(
+-                mask_distance[y, x]
+-                / max(1.0, 20.0 * scale),
+-                0.0,
+-                1.0,
+-            )
++            np.clip(mask_distance[y, x] / (2.0 * period), 0.0, 1.0)
+         )
+ 
+         confidence = float(
+@@ -585,124 +672,76 @@ def detect_minutiae(
+ 
+         theta = orientation[y, x]
+ 
+-        if np.isfinite(theta):
+-            theta = float(theta)
+-        else:
+-            theta = None
+-
+-        point = {
+-            "x": x,
+-            "y": y,
+-            "type": minutia_type,
+-            "support": support,
+-            "coherence": local_coherence,
+-            "confidence": confidence,
+-            "orientation": theta,
+-        }
+-
+-        if minutia_type == "ridge_ending":
+-            endings.append(point)
+-        else:
+-            bifurcations.append(point)
++        candidates.append(
++            {
++                "x": x,
++                "y": y,
++                "type": minutia_type,
++                "support": support,
++                "coherence": local_coherence,
++                "confidence": confidence,
++                "orientation": float(theta) if np.isfinite(theta) else None,
++            }
++        )
+ 
+-    # Remove nearby duplicates.
+-    endings = cluster_points(
+-        endings,
+-        min_distance=min_distance,
+-    )
++    candidates = cluster_points(candidates, min_distance=min_distance)
+ 
+-    bifurcations = cluster_points(
+-        bifurcations,
+-        min_distance=min_distance,
+-    )
++    for point in candidates:
++        point["angle"] = _minutia_angle(
++            cleaned, point["y"], point["x"], point["type"]
++        )
+ 
+-    # Also suppress an ending and bifurcation that represent the same
+-    # local artifact.
+-    all_candidates = cluster_points(
+-        endings + bifurcations,
+-        min_distance=min_distance,
+-    )
++    candidates = _remove_spurious_pairs(candidates, period)
+ 
+-    endings = [
+-        point
+-        for point in all_candidates
+-        if point["type"] == "ridge_ending"
+-    ]
+-
+-    bifurcations = [
+-        point
+-        for point in all_candidates
+-        if point["type"] == "bifurcation"
++    points = [
++        {
++            "x": int(p["x"]),
++            "y": int(p["y"]),
++            "type": p["type"],
++            "orientation": p["orientation"],
++            "angle": p["angle"],
++            "confidence": float(np.clip(p["confidence"], 0.0, 1.0)),
++        }
++        for p in candidates
+     ]
+ 
+-    points = []
+-
+-    for point in all_candidates:
+-        points.append(
+-            {
+-                "x": int(point["x"]),
+-                "y": int(point["y"]),
+-                "type": point["type"],
+-                "orientation": (
+-                    float(point["orientation"])
+-                    if point["orientation"] is not None
+-                    else None
+-                ),
+-                "confidence": float(
+-                    np.clip(
+-                        point["confidence"],
+-                        0.0,
+-                        1.0,
+-                    )
+-                ),
+-            }
+-        )
+-
+-    # --------------------------------------------------------
+-    # Global sanity checks
+-    # --------------------------------------------------------
++    endings = [p for p in points if p["type"] == "ridge_ending"]
++    bifurcations = [p for p in points if p["type"] == "bifurcation"]
+ 
+     skeleton_pixels = int(np.count_nonzero(cleaned))
+-    point_count = len(points)
+ 
+-    if skeleton_pixels == 0:
+-        return _empty_result()
++    if skeleton_pixels == 0 or not points:
++        result = _empty_result()
++        result["reasons"] = ["no_minutiae_found"]
++        return result
+ 
+-    point_density = point_count / float(skeleton_pixels)
++    reasons = []
+ 
+-    # Fingerprint minutiae should be sparse relative to the complete
+-    # skeleton. Extremely dense detections indicate threshold/skeleton
+-    # artifacts rather than genuine minutiae.
+-    density_limit = 0.025
++    point_density = len(points) / float(skeleton_pixels)
++    mean_confidence = float(np.mean([p["confidence"] for p in points]))
+ 
+-    # Avoid accepting a tiny number of weak points as a meaningful
+-    # detector result.
+-    confidence_values = [
+-        point["confidence"]
+-        for point in points
+-    ]
++    ratio = len(endings) / max(1, len(bifurcations))
+ 
+-    mean_confidence = (
+-        float(np.mean(confidence_values))
+-        if confidence_values
+-        else 0.0
+-    )
++    if len(points) < 8:
++        reasons.append("too_few_minutiae")
+ 
+-    reliable = bool(
+-        2 <= point_count <= 120
+-        and point_density <= density_limit
+-        and mean_confidence >= 0.55
+-    )
++    if point_density > 0.04:
++        reasons.append("minutiae_density_too_high_noisy_skeleton")
+ 
+-    if not reliable:
+-        return _empty_result()
++    if mean_confidence < 0.50:
++        reasons.append("low_mean_confidence")
++
++    if ratio > 6.0 or ratio < 1.0 / 6.0:
++        reasons.append("implausible_ending_to_bifurcation_ratio")
+ 
+     return {
+-        "total": int(point_count),
++        "total": int(len(points)),
+         "ridge_endings": int(len(endings)),
+         "bifurcations": int(len(bifurcations)),
+         "points": points,
+-        "reliable": True,
++        "reliable": len(reasons) == 0,
++        "reasons": reasons,
++        "mean_confidence": mean_confidence,
+     }
+ 
+ 
+@@ -715,6 +754,7 @@ def analyze_minutiae(
+     mask,
+     orientation,
+     coherence,
++    ridge_spacing=None,
+ ):
+     """
+     Complete minutiae-processing pipeline.
+@@ -737,6 +777,7 @@ def analyze_minutiae(
+         mask=mask,
+         orientation=orientation,
+         coherence=coherence,
++        ridge_spacing=ridge_spacing,
+     )
+ 
+     return {
+diff --git a/processing/orientation.py b/processing/orientation.py
+index d992eea..718e90d 100644
+--- a/processing/orientation.py
++++ b/processing/orientation.py
+@@ -2,65 +2,89 @@ import cv2
+ import numpy as np
+ 
+ 
+-def estimate_orientation(image, block_size=16):
++def _wrap_orientation(theta):
++    """Wrap an orientation angle into [-pi/2, pi/2)."""
++    return (theta + np.pi / 2.0) % np.pi - np.pi / 2.0
++
++
++def estimate_orientation(
++    image,
++    block_size=16,
++    mask=None,
++    sigma_tensor=None,
++    pre_sigma=1.0,
++):
+     """
+-    Estimate local fingerprint ridge orientation
+-    and orientation coherence.
++    Estimate the local RIDGE orientation and orientation coherence.
++
++    Convention (important)
++    ----------------------
++    The returned orientation is the direction of the ridge *lines*,
++    measured from the +x axis in image coordinates (y points down),
++    in radians, wrapped to [-pi/2, pi/2).
++
++    The structure tensor gives the dominant *gradient* direction,
++    which is perpendicular to the ridge, so pi/2 is added.
++    (The previous implementation returned the gradient direction,
++    i.e. the ridge orientation rotated by 90 degrees.)
++
++    Args:
++        image:
++            Grayscale image. Pass the *unmasked* image together with
++            ``mask`` -- feeding an already-masked image creates a
++            strong artificial gradient along the mask border.
++        block_size:
++            Nominal analysis block. The structure tensor is averaged
++            with a Gaussian of sigma = 0.4 * block_size unless
++            ``sigma_tensor`` is given. This must span at least one
++            ridge period; the old fixed 17x17/sigma~2.9 window was
++            smaller than a ridge period on 512 px prints.
++        mask:
++            Optional foreground mask (0 / non-zero). Gradients outside
++            the mask are excluded (normalised convolution).
++        sigma_tensor:
++            Override for the averaging sigma in pixels.
++        pre_sigma:
++            Small Gaussian pre-smoothing before taking gradients.
+ 
+     Returns:
+-        orientation: orientation map in radians
+-        coherence: confidence/coherence map from 0 to 1
++        orientation: ridge orientation map (radians, [-pi/2, pi/2))
++        coherence:   0..1 map (1 = perfectly oriented neighbourhood)
+     """
++    img = image.astype(np.float32)
+ 
+-    gx = cv2.Sobel(
+-        image,
+-        cv2.CV_64F,
+-        1,
+-        0,
+-        ksize=3
+-    )
+-
+-    gy = cv2.Sobel(
+-        image,
+-        cv2.CV_64F,
+-        0,
+-        1,
+-        ksize=3
+-    )
+-
+-    kernel_size = block_size | 1
+-
+-    gxx = cv2.GaussianBlur(
+-        gx * gx,
+-        (kernel_size, kernel_size),
+-        0
+-    )
+-
+-    gyy = cv2.GaussianBlur(
+-        gy * gy,
+-        (kernel_size, kernel_size),
+-        0
+-    )
+-
+-    gxy = cv2.GaussianBlur(
+-        gx * gy,
+-        (kernel_size, kernel_size),
+-        0
+-    )
+-
+-    orientation = 0.5 * np.arctan2(
+-        2 * gxy,
+-        gxx - gyy
+-    )
+-
+-    numerator = np.sqrt(
+-        (gxx - gyy) ** 2 +
+-        (2 * gxy) ** 2
+-    )
++    if pre_sigma and pre_sigma > 0:
++        img = cv2.GaussianBlur(img, (0, 0), float(pre_sigma))
+ 
+-    denominator = gxx + gyy + 1e-8
++    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
++    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
++
++    gxx = gx * gx
++    gyy = gy * gy
++    gxy = gx * gy
+ 
+-    coherence = numerator / denominator
+-    coherence = np.clip(coherence, 0, 1)
++    sigma = float(sigma_tensor) if sigma_tensor else 0.4 * float(block_size)
++
++    if mask is not None:
++        w = (mask > 0).astype(np.float32)
++        gxx *= w
++        gyy *= w
++        gxy *= w
++        norm = cv2.GaussianBlur(w, (0, 0), sigma) + 1e-6
++    else:
++        norm = 1.0
++
++    gxx = cv2.GaussianBlur(gxx, (0, 0), sigma) / norm
++    gyy = cv2.GaussianBlur(gyy, (0, 0), sigma) / norm
++    gxy = cv2.GaussianBlur(gxy, (0, 0), sigma) / norm
++
++    gradient_orientation = 0.5 * np.arctan2(2.0 * gxy, gxx - gyy)
++
++    # ridge direction is perpendicular to the dominant gradient
++    orientation = _wrap_orientation(gradient_orientation + np.pi / 2.0)
++
++    numerator = np.sqrt((gxx - gyy) ** 2 + (2.0 * gxy) ** 2)
++    denominator = gxx + gyy + 1e-8
++    coherence = np.clip(numerator / denominator, 0.0, 1.0)
+ 
+-    return orientation, coherence
+\ No newline at end of file
++    return orientation.astype(np.float32), coherence.astype(np.float32)
+diff --git a/processing/pattern.py b/processing/pattern.py
+index 2c687d8..58c420d 100644
+--- a/processing/pattern.py
++++ b/processing/pattern.py
+@@ -1,3 +1,23 @@
++"""
++Fingerprint pattern / singular-point analysis.
++
++Pipeline
++--------
++    ridge orientation map
++        -> block orientation grid        (block_orientation)
++        -> Poincare index map            (compute_poincare_index)
++        -> core / delta candidates       (find_poincare_candidates)
++        -> selected core + delta         (select_core_delta)
++        -> Arch / Loop / Whorl evidence  (infer_pattern)
++
++Conventions
++-----------
++* Orientation is the ridge-line direction (radians, period pi).
++* Poincare index: +0.5 = core, -0.5 = delta, +1.0 = double core
++  (concentric / spiral whorl centre).
++"""
++
++import cv2
+ import numpy as np
+ 
+ 
+@@ -25,6 +45,11 @@ def _safe_float(value):
+     return value
+ 
+ 
++def _wrap_half_pi(delta):
++    """Wrap an orientation difference (period pi) into (-pi/2, pi/2]."""
++    return (delta + np.pi / 2.0) % np.pi - np.pi / 2.0
++
++
+ # ============================================================
+ # Block orientation
+ # ============================================================
+@@ -34,47 +59,29 @@ def block_orientation(
+     coherence,
+     mask,
+     block_size=16,
+-    min_foreground_ratio=0.50,
++    min_foreground_ratio=0.35,
+     min_coherence=0.25,
+ ):
+     """
+-    Convert the pixel-level orientation field into a
+-    block-level orientation field.
++    Convert the pixel-level orientation field into a block-level field.
+ 
+-    Fingerprint orientation has 180-degree periodicity,
+-    therefore circular averaging is performed using:
+-
+-        exp(i * 2 * theta)
++    Fingerprint orientation has 180-degree periodicity, so circular
++    averaging is done on exp(i * 2 * theta).
+ 
+     Args:
+-        orientation:
+-            Pixel-level orientation map in radians.
+-
+-        coherence:
+-            Pixel-level orientation coherence map.
+-
+-        mask:
+-            Fingerprint foreground mask.
+-
+-        block_size:
+-            Size of orientation blocks in pixels.
+-
++        orientation: Pixel-level ridge orientation (radians).
++        coherence:   Pixel-level coherence map.
++        mask:        Foreground mask.
++        block_size:  Block edge in pixels.
+         min_foreground_ratio:
+-            Minimum percentage of a block that must belong
+-            to the fingerprint foreground.
+-
++            Minimum fraction of a block inside the foreground.
++            (Was 0.50; relaxed because deltas are usually close to
++            the print border.)
+         min_coherence:
+-            Minimum median coherence required for a block.
++            Minimum median coherence for a block to be usable.
+ 
+     Returns:
+-        orientation_grid:
+-            Block-level orientation map.
+-
+-        coherence_grid:
+-            Block-level coherence map.
+-
+-        valid_grid:
+-            Boolean map identifying usable blocks.
++        orientation_grid, coherence_grid, valid_grid
+     """
+ 
+     if orientation is None:
+@@ -102,19 +109,13 @@ def block_orientation(
+     grid_width = width // block_size
+ 
+     orientation_grid = np.full(
+-        (grid_height, grid_width),
+-        np.nan,
+-        dtype=np.float32,
++        (grid_height, grid_width), np.nan, dtype=np.float32
+     )
+-
+     coherence_grid = np.zeros(
+-        (grid_height, grid_width),
+-        dtype=np.float32,
++        (grid_height, grid_width), dtype=np.float32
+     )
+-
+     valid_grid = np.zeros(
+-        (grid_height, grid_width),
+-        dtype=bool,
++        (grid_height, grid_width), dtype=bool
+     )
+ 
+     for by in range(grid_height):
+@@ -122,108 +123,95 @@ def block_orientation(
+         for bx in range(grid_width):
+ 
+             y1 = by * block_size
+-            y2 = (by + 1) * block_size
+-
++            y2 = y1 + block_size
+             x1 = bx * block_size
+-            x2 = (bx + 1) * block_size
++            x2 = x1 + block_size
+ 
+             block_mask = mask[y1:y2, x1:x2] > 0
+ 
+-            foreground_ratio = float(
+-                np.mean(block_mask)
+-            )
+-
+-            if foreground_ratio < min_foreground_ratio:
+-                continue
+-
+-            block_coherence = coherence[
+-                y1:y2,
+-                x1:x2
+-            ][block_mask]
+-
+-            if block_coherence.size == 0:
++            if float(np.mean(block_mask)) < min_foreground_ratio:
+                 continue
+ 
+-            block_coherence = block_coherence[
+-                np.isfinite(block_coherence)
+-            ]
++            block_coherence = coherence[y1:y2, x1:x2][block_mask]
++            block_coherence = block_coherence[np.isfinite(block_coherence)]
+ 
+             if block_coherence.size == 0:
+                 continue
+ 
+-            median_coherence = float(
+-                np.median(block_coherence)
+-            )
++            median_coherence = float(np.median(block_coherence))
+ 
+             if median_coherence < min_coherence:
+                 continue
+ 
+-            block_orientation = orientation[
+-                y1:y2,
+-                x1:x2
+-            ][block_mask]
++            block_theta = orientation[y1:y2, x1:x2][block_mask]
++            block_theta = block_theta[np.isfinite(block_theta)]
+ 
+-            block_orientation = block_orientation[
+-                np.isfinite(block_orientation)
+-            ]
+-
+-            if block_orientation.size == 0:
++            if block_theta.size == 0:
+                 continue
+ 
+-            # Circular mean for an orientation field
+-            # with pi-periodicity.
+-            doubled = 2.0 * block_orientation
+-
+-            vector = np.mean(
+-                np.exp(1j * doubled)
+-            )
+-
+-            angle = 0.5 * np.angle(vector)
+-
+-            orientation_grid[
+-                by,
+-                bx
+-            ] = float(angle)
+-
+-            coherence_grid[
+-                by,
+-                bx
+-            ] = median_coherence
++            vector = np.mean(np.exp(2j * block_theta))
+ 
+-            valid_grid[
+-                by,
+-                bx
+-            ] = True
++            orientation_grid[by, bx] = float(0.5 * np.angle(vector))
++            coherence_grid[by, bx] = median_coherence
++            valid_grid[by, bx] = True
+ 
+-    return (
+-        orientation_grid,
+-        coherence_grid,
+-        valid_grid,
+-    )
++    return orientation_grid, coherence_grid, valid_grid
+ 
+ 
+ # ============================================================
+ # Poincare index
+ # ============================================================
+ 
++def _ring_offsets(radius):
++    """Clockwise (on screen) ring of integer offsets at Chebyshev radius."""
++    r = int(radius)
++    ring = []
++    for x in range(-r, r + 1):          # top edge, left -> right
++        ring.append((-r, x))
++    for y in range(-r + 1, r + 1):      # right edge, top -> bottom
++        ring.append((y, r))
++    for x in range(r - 1, -r - 1, -1):  # bottom edge, right -> left
++        ring.append((r, x))
++    for y in range(r - 1, -r, -1):      # left edge, bottom -> top
++        ring.append((y, -r))
++    return ring
++
++
+ def compute_poincare_index(
+     orientation_grid,
+     valid_grid,
++    radius=1,
++    require_center_valid=False,
+ ):
+     """
+-    Compute the Poincare index on a block orientation field.
+-
+-    Because fingerprint orientation has 180-degree ambiguity,
+-    orientation is doubled before angular differences are
+-    calculated.
+-
+-    A value close to:
+-
+-        +0.5 -> core-like singularity
+-        -0.5 -> delta-like singularity
++    Poincare index of a block orientation field.
++
++    For every cell the orientation change is summed along the closed
++    ring of cells at Chebyshev distance ``radius`` and divided by 2*pi:
++
++        +0.5 -> core        -0.5 -> delta
++        +1.0 -> double core  0.0 -> regular flow
++
++    Orientation has period pi, so each step is wrapped to
++    (-pi/2, pi/2]. For a closed ring the sum is an exact multiple of
++    pi, so valid outputs are quantised to multiples of 0.5.
++
++    BUGS FIXED relative to the original implementation
++    --------------------------------------------------
++    1. The original doubled the angles, wrapped to (-pi, pi] and divided
++       by 2*pi, which is TWICE the Poincare index. A true core gave
++       +1.0 and a true delta -1.0. Because the ring is closed the result
++       could only be a whole number, so the +/-0.5 acceptance window in
++       the candidate detector was unreachable: no core or delta could
++       ever be reported, so pattern/core/delta were always None.
++    2. The original required all 9 blocks (including the centre block)
++       to be valid. The centre block of a singular point has low
++       coherence by definition, so true singularities were discarded.
++       Only the ring cells need to be valid now.
+ 
+     Returns:
+-        2D Poincare-index map.
++        2D array, shape (H - 2*radius, W - 2*radius). Entry [y, x]
++        belongs to grid cell (y + radius, x + radius).
+     """
+ 
+     if orientation_grid.ndim != 2:
+@@ -233,88 +221,51 @@ def compute_poincare_index(
+ 
+     if orientation_grid.shape != valid_grid.shape:
+         raise ValueError(
+-            "orientation_grid and valid_grid must have "
+-            "the same shape."
++            "orientation_grid and valid_grid must have the same shape."
+         )
+ 
++    radius = int(radius)
+     height, width = orientation_grid.shape
+ 
+-    if height < 3 or width < 3:
+-        return np.empty(
+-            (0, 0),
+-            dtype=np.float32,
+-        )
++    if height < 2 * radius + 1 or width < 2 * radius + 1:
++        return np.empty((0, 0), dtype=np.float32)
+ 
+     poincare = np.full(
+-        (height - 2, width - 2),
++        (height - 2 * radius, width - 2 * radius),
+         np.nan,
+         dtype=np.float32,
+     )
+ 
+-    for y in range(1, height - 1):
++    offsets = _ring_offsets(radius)
++    theta = np.asarray(orientation_grid, dtype=np.float64)
+ 
+-        for x in range(1, width - 1):
++    for y in range(radius, height - radius):
+ 
+-            local_valid = valid_grid[
+-                y - 1:y + 2,
+-                x - 1:x + 2
+-            ]
++        for x in range(radius, width - radius):
+ 
+-            if not np.all(local_valid):
++            if require_center_valid and not valid_grid[y, x]:
+                 continue
+ 
+-            ring = np.array(
+-                [
+-                    orientation_grid[y - 1, x - 1],
+-                    orientation_grid[y - 1, x],
+-                    orientation_grid[y - 1, x + 1],
+-                    orientation_grid[y, x + 1],
+-                    orientation_grid[y + 1, x + 1],
+-                    orientation_grid[y + 1, x],
+-                    orientation_grid[y + 1, x - 1],
+-                    orientation_grid[y, x - 1],
+-                    orientation_grid[y - 1, x - 1],
+-                ],
+-                dtype=np.float64,
++            ring_valid = all(
++                valid_grid[y + dy, x + dx] for dy, dx in offsets
+             )
+ 
+-            if not np.all(np.isfinite(ring)):
++            if not ring_valid:
+                 continue
+ 
+-            doubled = ring * 2.0
++            ring = [theta[y + dy, x + dx] for dy, dx in offsets]
++            ring.append(ring[0])
++            ring = np.asarray(ring, dtype=np.float64)
+ 
+-            differences = []
+-
+-            for index in range(
+-                len(doubled) - 1
+-            ):
+-                delta = (
+-                    doubled[index + 1]
+-                    - doubled[index]
+-                )
+-
+-                wrapped = np.arctan2(
+-                    np.sin(delta),
+-                    np.cos(delta),
+-                )
++            if not np.all(np.isfinite(ring)):
++                continue
+ 
+-                differences.append(
+-                    wrapped
+-                )
++            steps = _wrap_half_pi(np.diff(ring))
+ 
+-            # Because the orientation was doubled,
+-            # divide by 2*pi to obtain the standard
+-            # fingerprint Poincare index.
+-            value = (
+-                np.sum(differences)
+-                / (2.0 * np.pi)
++            poincare[y - radius, x - radius] = float(
++                np.sum(steps) / (2.0 * np.pi)
+             )
+ 
+-            poincare[
+-                y - 1,
+-                x - 1
+-            ] = float(value)
+-
+     return poincare
+ 
+ 
+@@ -322,33 +273,61 @@ def compute_poincare_index(
+ # Candidate detection
+ # ============================================================
+ 
++def _cluster_cells(cells, max_gap):
++    """
++    Group neighbouring flagged cells (a real singular point fires on
++    2-4 adjacent cells) and return a list of clusters (lists of cells).
++    """
++    remaining = list(cells)
++    clusters = []
++
++    while remaining:
++        seed = remaining.pop()
++        cluster = [seed]
++        queue = [seed]
++
++        while queue:
++            cy, cx = queue.pop()
++            near = [
++                c for c in remaining
++                if max(abs(c[0] - cy), abs(c[1] - cx)) <= max_gap
++            ]
++            for c in near:
++                remaining.remove(c)
++                cluster.append(c)
++                queue.append(c)
++
++        clusters.append(cluster)
++
++    return clusters
++
++
+ def find_poincare_candidates(
+     orientation,
+     coherence,
+     mask,
+     block_size=16,
+-    poincare_tolerance=0.18,
+-    min_coherence=0.35,
+-    min_foreground_ratio=0.50,
++    ring_radius=1,
++    poincare_tolerance=0.2,
++    min_coherence=0.30,
++    min_foreground_ratio=0.35,
+ ):
+     """
+     Find possible core and delta singularities.
+ 
+-    Candidate detection is intentionally conservative.
+-
+     A candidate must:
+-        1. Exist inside the fingerprint foreground.
+-        2. Have adequate local orientation coherence.
+-        3. Have a Poincare value close to +0.5 or -0.5.
+-        4. Not be located directly at the orientation-grid boundary.
++        1. be inside the foreground (all ring blocks valid),
++        2. have a Poincare index near +0.5 (core), -0.5 (delta)
++           or +1.0 (double core),
++        3. have adequate ring coherence.
++
++    Adjacent flagged cells are merged and the centroid is reported,
++    which makes the location stable and gives a natural confidence
++    measure (number of agreeing cells).
+ 
+     Returns:
+-        Dictionary containing:
+-            candidates
+-            orientation_grid
+-            coherence_grid
+-            valid_grid
+-            poincare
++        dict with candidates, orientation_grid, coherence_grid,
++        valid_grid, poincare
+     """
+ 
+     (
+@@ -367,210 +346,139 @@ def find_poincare_candidates(
+     poincare = compute_poincare_index(
+         orientation_grid,
+         valid_grid,
++        radius=ring_radius,
+     )
+ 
+-    candidates = []
++    result = {
++        "candidates": [],
++        "orientation_grid": orientation_grid,
++        "coherence_grid": coherence_grid,
++        "valid_grid": valid_grid,
++        "poincare": poincare,
++    }
+ 
+     if poincare.size == 0:
+-        return {
+-            "candidates": [],
+-            "orientation_grid": orientation_grid,
+-            "coherence_grid": coherence_grid,
+-            "valid_grid": valid_grid,
+-            "poincare": poincare,
+-        }
++        return result
+ 
+-    height, width = poincare.shape
++    tol = float(poincare_tolerance)
++    off = int(ring_radius)
+ 
+-    for y in range(height):
++    flagged = {"core": [], "delta": [], "double_core": []}
+ 
+-        for x in range(width):
++    for y, x in np.argwhere(np.isfinite(poincare)):
+ 
+-            value = poincare[y, x]
++        value = float(poincare[y, x])
+ 
+-            if not np.isfinite(value):
+-                continue
++        if abs(value - 0.5) <= tol:
++            flagged["core"].append((int(y), int(x)))
++        elif abs(value + 0.5) <= tol:
++            flagged["delta"].append((int(y), int(x)))
++        elif abs(value - 1.0) <= tol:
++            flagged["double_core"].append((int(y), int(x)))
+ 
+-            # Core ≈ +0.5
+-            # Delta ≈ -0.5
+-            distance_to_singularity = min(
+-                abs(value - 0.5),
+-                abs(value + 0.5),
+-            )
++    candidates = []
+ 
+-            if (
+-                distance_to_singularity
+-                > poincare_tolerance
+-            ):
+-                continue
++    for kind, cells in flagged.items():
+ 
+-            grid_y = y + 1
+-            grid_x = x + 1
+-
+-            local_coherence = coherence_grid[
+-                max(0, grid_y - 1):
+-                min(
+-                    coherence_grid.shape[0],
+-                    grid_y + 2,
+-                ),
+-                max(0, grid_x - 1):
+-                min(
+-                    coherence_grid.shape[1],
+-                    grid_x + 2,
+-                ),
+-            ]
++        for cluster in _cluster_cells(cells, max_gap=1):
+ 
+-            local_coherence = local_coherence[
+-                np.isfinite(local_coherence)
+-            ]
+-
+-            if local_coherence.size == 0:
+-                continue
++            ys = np.array([c[0] + off for c in cluster], dtype=np.float64)
++            xs = np.array([c[1] + off for c in cluster], dtype=np.float64)
+ 
+-            candidate_coherence = float(
+-                np.median(local_coherence)
+-            )
++            gy = float(np.mean(ys))
++            gx = float(np.mean(xs))
+ 
+-            if candidate_coherence < min_coherence:
+-                continue
++            pixel_x = int(round(gx * block_size + block_size / 2.0))
++            pixel_y = int(round(gy * block_size + block_size / 2.0))
+ 
+-            # Convert block coordinates into image coordinates.
+-            pixel_x = int(
+-                grid_x * block_size
+-                + block_size // 2
+-            )
++            iy = int(round(gy))
++            ix = int(round(gx))
+ 
+-            pixel_y = int(
+-                grid_y * block_size
+-                + block_size // 2
+-            )
++            window = coherence_grid[
++                max(0, iy - off - 1):iy + off + 2,
++                max(0, ix - off - 1):ix + off + 2,
++            ]
++            window = window[window > 0]
+ 
+-            # Determine candidate type.
+-            if value > 0:
+-                candidate_type = "core_candidate"
+-            else:
+-                candidate_type = "delta_candidate"
++            ring_coherence = float(np.median(window)) if window.size else 0.0
+ 
+-            # Confidence combines:
+-            # - Poincare closeness to ±0.5
+-            # - orientation coherence
+-            poincare_score = float(
+-                np.clip(
+-                    1.0
+-                    - (
+-                        distance_to_singularity
+-                        / max(
+-                            poincare_tolerance,
+-                            1e-8,
+-                        )
+-                    ),
+-                    0.0,
+-                    1.0,
+-                )
+-            )
++            support = min(1.0, len(cluster) / 3.0)
+ 
+             confidence = float(
+                 np.clip(
+-                    0.5 * poincare_score
+-                    + 0.5 * candidate_coherence,
++                    0.55 * ring_coherence + 0.45 * support,
+                     0.0,
+                     1.0,
+                 )
+             )
+ 
++            values = [
++                float(poincare[c[0], c[1]]) for c in cluster
++            ]
++
+             candidates.append(
+                 {
+-                    "type": candidate_type,
++                    "type": (
++                        "delta_candidate"
++                        if kind == "delta"
++                        else "core_candidate"
++                    ),
++                    "multiplicity": 2 if kind == "double_core" else 1,
+                     "x": pixel_x,
+                     "y": pixel_y,
+-                    "poincare_index": float(value),
+-                    "coherence": candidate_coherence,
++                    "poincare_index": float(np.mean(values)),
++                    "coherence": ring_coherence,
++                    "support_cells": len(cluster),
+                     "confidence": confidence,
+                 }
+             )
+ 
+     # --------------------------------------------------------
+-    # Non-maximum suppression
++    # Non-maximum suppression (same type only)
+     # --------------------------------------------------------
+ 
+     selected = []
+-
+-    min_distance = max(
+-        block_size * 2,
+-        int(
+-            min(mask.shape)
+-            * 0.04
+-        ),
+-    )
++    min_distance = max(block_size * 1.5, min(mask.shape) * 0.04)
+ 
+     for candidate in sorted(
+         candidates,
+         key=lambda item: item["confidence"],
+         reverse=True,
+     ):
+-
+-        too_close = False
+-
+-        for existing in selected:
+-
+-            distance_squared = (
+-                (
+-                    candidate["x"]
+-                    - existing["x"]
+-                ) ** 2
+-                +
+-                (
+-                    candidate["y"]
+-                    - existing["y"]
+-                ) ** 2
+-            )
+-
+-            if (
+-                distance_squared
+-                < min_distance ** 2
+-            ):
+-                too_close = True
+-                break
++        too_close = any(
++            existing["type"] == candidate["type"]
++            and (
++                (candidate["x"] - existing["x"]) ** 2
++                + (candidate["y"] - existing["y"]) ** 2
++            ) < min_distance ** 2
++            for existing in selected
++        )
+ 
+         if not too_close:
+             selected.append(candidate)
+ 
+-    return {
+-        "candidates": selected,
+-        "orientation_grid": orientation_grid,
+-        "coherence_grid": coherence_grid,
+-        "valid_grid": valid_grid,
+-        "poincare": poincare,
+-    }
++    result["candidates"] = selected
++
++    return result
+ 
+ 
+ # ============================================================
+ # Core / Delta selection
+ # ============================================================
+ 
+-def select_core_delta(
++def usable_candidates(
+     candidates,
+     image_shape,
+-    min_confidence=0.55,
++    min_confidence=0.45,
+ ):
+     """
+-    Select at most one core and one delta candidate.
+-
+-    The detector does not force a result.
+-
+-    If evidence is insufficient, the corresponding point
+-    remains unavailable.
++    Candidates that are far enough from the image border and have
++    adequate confidence.
+     """
+ 
+     height, width = image_shape[:2]
+ 
+-    margin = max(
+-        16,
+-        int(
+-            min(height, width)
+-            * 0.06
+-        ),
+-    )
++    margin = max(16, int(min(height, width) * 0.05))
+ 
+     usable = []
+ 
+@@ -587,70 +495,62 @@ def select_core_delta(
+         ):
+             continue
+ 
+-        if (
+-            candidate["confidence"]
+-            < min_confidence
+-        ):
++        if candidate["confidence"] < min_confidence:
+             continue
+ 
+         usable.append(candidate)
+ 
+-    cores = [
+-        candidate
+-        for candidate in usable
+-        if candidate["type"]
+-        == "core_candidate"
+-    ]
++    return usable
++
++
++def select_core_delta(
++    candidates,
++    image_shape,
++    min_confidence=0.45,
++):
++    """
++    Select at most one core and one delta candidate.
+ 
+-    deltas = [
+-        candidate
+-        for candidate in usable
+-        if candidate["type"]
+-        == "delta_candidate"
+-    ]
++    The detector does not force a result; if evidence is
++    insufficient the corresponding point stays unavailable.
++    """
++
++    height, width = image_shape[:2]
++
++    usable = usable_candidates(
++        candidates,
++        image_shape,
++        min_confidence=min_confidence,
++    )
++
++    cores = [c for c in usable if c["type"] == "core_candidate"]
++    deltas = [c for c in usable if c["type"] == "delta_candidate"]
+ 
+     core = (
+-        max(
+-            cores,
+-            key=lambda item: item["confidence"],
+-        )
++        max(cores, key=lambda item: item["confidence"])
+         if cores
+         else None
+     )
+ 
+-    # A delta that is extremely close to the core is
+-    # suspicious and is therefore rejected.
+     valid_deltas = deltas
+ 
++    # A delta extremely close to the core is suspicious.
+     if core is not None:
+ 
+-        minimum_separation = (
+-            min(height, width)
+-            * 0.10
+-        )
++        minimum_separation = min(height, width) * 0.08
+ 
+         valid_deltas = [
+             delta
+             for delta in deltas
+             if (
+-                (
+-                    delta["x"]
+-                    - core["x"]
+-                ) ** 2
+-                +
+-                (
+-                    delta["y"]
+-                    - core["y"]
+-                ) ** 2
+-            )
+-            >= minimum_separation ** 2
++                (delta["x"] - core["x"]) ** 2
++                + (delta["y"] - core["y"]) ** 2
++            ) >= minimum_separation ** 2
++            or core.get("multiplicity", 1) > 1
+         ]
+ 
+     delta = (
+-        max(
+-            valid_deltas,
+-            key=lambda item: item["confidence"],
+-        )
++        max(valid_deltas, key=lambda item: item["confidence"])
+         if valid_deltas
+         else None
+     )
+@@ -665,127 +565,154 @@ def select_core_delta(
+ def infer_pattern(
+     candidates,
+     mean_coherence,
++    image_shape=(512, 512),
++    valid_fraction=None,
+ ):
+     """
+-    Infer fingerprint pattern from singularity evidence.
++    Infer Arch / Loop / Whorl from singular-point evidence.
++
++    Rules (cores counted with multiplicity, so a +1 index counts as
++    two cores):
++
++        >=2 cores and >=1 delta     -> Whorl
++        >=1 core  and >=2 deltas    -> Whorl
++        1 core, 1 delta, close and
++        vertically stacked          -> Arch (tented arch)
++        1 core, 1 delta             -> Loop (+ left/right subtype)
++        2+ cores, no delta          -> Whorl (delta outside the print)
++        1 core, no delta            -> Loop (partial print, low conf.)
++        no singular point, and the
++        flow field is coherent and
++        well covered                -> Arch
++        otherwise                   -> unknown (None)
++
++    The previous version could not output Arch at all (any print
++    without singularities returned None, "because a failed detector
++    cannot prove an arch"). A plain arch genuinely has no
++    singularities, so absence is accepted as evidence only when the
++    orientation field was reliably measured over most of the print
++    (``valid_fraction``) and coherence is high.
++
++    Returns:
++        {"label", "confidence", "method", "subtype", "evidence"}
++    """
+ 
+-    This is deliberately conservative.
++    height, width = image_shape[:2]
++    min_dim = float(min(height, width))
+ 
+-    Evidence rules:
++    mean_coherence = _safe_float(mean_coherence) or 0.0
+ 
+-        Core + >=2 deltas -> Whorl evidence
+-        Core + >=1 delta  -> Loop evidence
+-        Otherwise         -> Unknown
++    cores = [c for c in candidates if c["type"] == "core_candidate"]
++    deltas = [c for c in candidates if c["type"] == "delta_candidate"]
+ 
+-    An absence of detected singularities is NOT automatically
+-    treated as Arch because a failed singularity detector
+-    cannot prove an arch.
++    n_cores = int(sum(c.get("multiplicity", 1) for c in cores))
++    n_deltas = len(deltas)
+ 
+-    Returns:
+-        {
+-            "label": ...,
+-            "confidence": ...,
+-            "method": ...
+-        }
+-    """
++    evidence = {
++        "cores": n_cores,
++        "deltas": n_deltas,
++        "mean_coherence": mean_coherence,
++        "valid_fraction": _safe_float(valid_fraction),
++    }
++
++    def result(label, confidence, subtype=None, why=""):
++        if label is None:
++            return {
++                "label": None,
++                "confidence": None,
++                "method": "poincare_singularity_analysis",
++                "subtype": None,
++                "evidence": evidence,
++            }
++
++        confidence = float(np.clip(confidence, 0.0, 1.0))
++
++        if mean_coherence < 0.40:
++            confidence *= 0.85
++
++        evidence["rule"] = why
+ 
+-    if not candidates:
+         return {
+-            "label": None,
+-            "confidence": None,
++            "label": label,
++            "confidence": confidence,
+             "method": "poincare_singularity_analysis",
++            "subtype": subtype,
++            "evidence": evidence,
+         }
+ 
+-    cores = [
+-        candidate
+-        for candidate in candidates
+-        if candidate["type"]
+-        == "core_candidate"
+-    ]
+-
+-    deltas = [
+-        candidate
+-        for candidate in candidates
+-        if candidate["type"]
+-        == "delta_candidate"
+-    ]
+-
+-    mean_coherence = _safe_float(
+-        mean_coherence
+-    )
+-
+-    if mean_coherence is None:
+-        mean_coherence = 0.0
++    # ---- Whorl ----
++    if n_cores >= 2 and n_deltas >= 1:
++        return result(
++            "Whorl",
++            min(0.92, 0.70 + 0.06 * min(n_deltas, 2) + 0.04 * min(n_cores, 2)),
++            why=">=2 cores and >=1 delta",
++        )
+ 
+-    if (
+-        len(cores) >= 1
+-        and len(deltas) >= 2
+-    ):
++    if n_cores >= 1 and n_deltas >= 2:
++        return result(
++            "Whorl",
++            min(0.90, 0.68 + 0.05 * min(n_deltas, 3)),
++            why=">=1 core and >=2 deltas",
++        )
+ 
+-        confidence = min(
+-            0.95,
+-            0.55
+-            + 0.08 * len(cores)
+-            + 0.06 * len(deltas),
++    if n_cores >= 2 and n_deltas == 0:
++        return result(
++            "Whorl",
++            0.62,
++            why=">=2 cores, deltas outside the print",
+         )
+ 
+-        if (
+-            mean_coherence < 0.45
+-        ):
+-            confidence *= 0.85
++    # ---- Loop / tented arch ----
++    if n_cores == 1 and n_deltas == 1:
+ 
+-        if confidence >= 0.60:
++        core = cores[0]
++        delta = deltas[0]
+ 
+-            return {
+-                "label": "Whorl",
+-                "confidence": float(
+-                    np.clip(
+-                        confidence,
+-                        0.0,
+-                        1.0,
+-                    )
+-                ),
+-                "method":
+-                    "poincare_singularity_analysis",
+-            }
++        dx = delta["x"] - core["x"]
++        dy = delta["y"] - core["y"]
++        separation = float(np.hypot(dx, dy))
+ 
+-    if (
+-        len(cores) >= 1
+-        and len(deltas) >= 1
+-    ):
++        if separation < 0.14 * min_dim and abs(dx) < 0.07 * min_dim:
++            return result(
++                "Arch",
++                0.64,
++                subtype="tented_arch",
++                why="core and delta close together and vertically stacked",
++            )
+ 
+-        confidence = min(
+-            0.90,
+-            0.52
+-            + 0.10 * min(len(cores), 1)
+-            + 0.08 * min(len(deltas), 1),
++        subtype = "left_loop" if dx > 0 else "right_loop"
++
++        return result(
++            "Loop",
++            0.78,
++            subtype=subtype,
++            why="1 core and 1 delta",
+         )
+ 
+-        if (
+-            mean_coherence < 0.45
+-        ):
+-            confidence *= 0.85
++    if n_cores == 1 and n_deltas == 0:
++        return result(
++            "Loop",
++            0.58,
++            subtype=None,
++            why="single core, delta not visible (partial print?)",
++        )
+ 
+-        if confidence >= 0.60:
++    # ---- Plain arch ----
++    if n_cores == 0 and n_deltas == 0:
+ 
+-            return {
+-                "label": "Loop",
+-                "confidence": float(
+-                    np.clip(
+-                        confidence,
+-                        0.0,
+-                        1.0,
+-                    )
+-                ),
+-                "method":
+-                    "poincare_singularity_analysis",
+-            }
++        if (
++            valid_fraction is not None
++            and valid_fraction >= 0.60
++            and mean_coherence >= 0.45
++        ):
++            return result(
++                "Arch",
++                0.66,
++                subtype="plain_arch",
++                why="no singular point in a well-measured, coherent field",
++            )
+ 
+-    return {
+-        "label": None,
+-        "confidence": None,
+-        "method": "poincare_singularity_analysis",
+-    }
++    return result(None, None)
+ 
+ 
+ # ============================================================
+@@ -805,12 +732,10 @@ def analyze_pattern(
+     Returns:
+         {
+             "pattern": {...},
+-            "singular_points": {
+-                "core": {...},
+-                "delta": {...},
+-            },
++            "singular_points": {"core": {...}, "delta": {...}},
+             "candidates": [...],
+-            "poincare": ...
++            "poincare": ...,
++            ...
+         }
+     """
+ 
+@@ -821,33 +746,27 @@ def analyze_pattern(
+         block_size=block_size,
+     )
+ 
+-    candidates = detection[
+-        "candidates"
+-    ]
++    candidates = detection["candidates"]
+ 
+     core, delta = select_core_delta(
+         candidates=candidates,
+         image_shape=image_shape,
+     )
+ 
++    usable = usable_candidates(
++        candidates,
++        image_shape,
++    )
++
+     foreground = mask > 0
+ 
+     if np.any(foreground):
+ 
+-        valid_coherence = coherence[
+-            foreground
+-        ]
+-
+-        valid_coherence = valid_coherence[
+-            np.isfinite(valid_coherence)
+-        ]
++        valid_coherence = coherence[foreground]
++        valid_coherence = valid_coherence[np.isfinite(valid_coherence)]
+ 
+         mean_coherence = (
+-            float(
+-                np.median(
+-                    valid_coherence
+-                )
+-            )
++            float(np.median(valid_coherence))
+             if valid_coherence.size
+             else 0.0
+         )
+@@ -855,9 +774,49 @@ def analyze_pattern(
+     else:
+         mean_coherence = 0.0
+ 
++    # Fraction of the print area whose orientation was measured
++    # reliably (grid blocks that are valid / blocks that touch the print).
++    valid_grid = detection["valid_grid"]
++    gh, gw = valid_grid.shape
++
++    if gh > 0 and gw > 0:
++        block_fg = (
++            (mask[: gh * block_size, : gw * block_size] > 0)
++            .reshape(gh, block_size, gw, block_size)
++            .mean(axis=(1, 3))
++        )
++        touching = block_fg >= 0.35
++        valid_fraction = (
++            float(np.sum(valid_grid & touching) / max(1, np.sum(touching)))
++        )
++    else:
++        valid_fraction = 0.0
++
++    # Guard for the "no singular point => Arch" rule: a fragmented,
++    # holey or tiny mask must never be allowed to prove an arch.
++    coverage = float(np.mean(foreground))
++    mask_u8 = (foreground.astype(np.uint8)) * 255
++    contours, _ = cv2.findContours(
++        mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
++    )
++    if contours:
++        hull_area = cv2.contourArea(
++            cv2.convexHull(max(contours, key=cv2.contourArea))
++        )
++        solidity = float(np.sum(foreground)) / max(1.0, hull_area)
++    else:
++        solidity = 0.0
++
++    valid_fraction *= min(1.0, solidity)
++
++    if coverage < 0.20:
++        valid_fraction = 0.0
++
+     pattern = infer_pattern(
+-        candidates=candidates,
++        candidates=usable,
+         mean_coherence=mean_coherence,
++        image_shape=image_shape,
++        valid_fraction=valid_fraction,
+     )
+ 
+     def point_output(point):
+@@ -874,9 +833,7 @@ def analyze_pattern(
+             "detected": True,
+             "x": int(point["x"]),
+             "y": int(point["y"]),
+-            "confidence": _safe_float(
+-                point["confidence"]
+-            ),
++            "confidence": _safe_float(point["confidence"]),
+         }
+ 
+     return {
+@@ -889,19 +846,11 @@ def analyze_pattern(
+ 
+         "candidates": candidates,
+ 
+-        "poincare": detection[
+-            "poincare"
+-        ],
++        "poincare": detection["poincare"],
+ 
+-        "orientation_grid": detection[
+-            "orientation_grid"
+-        ],
++        "orientation_grid": detection["orientation_grid"],
+ 
+-        "coherence_grid": detection[
+-            "coherence_grid"
+-        ],
++        "coherence_grid": detection["coherence_grid"],
+ 
+-        "valid_grid": detection[
+-            "valid_grid"
+-        ],
+-    }
+\ No newline at end of file
++        "valid_grid": detection["valid_grid"],
++    }
+diff --git a/processing/pipeline.py b/processing/pipeline.py
+index 86c5f2c..d1ee353 100644
+--- a/processing/pipeline.py
++++ b/processing/pipeline.py
+@@ -23,6 +23,10 @@ from processing.density import (
+     estimate_ridge_density,
+ )
+ 
++from processing.enhancement import (
++    gabor_enhance,
++)
++
+ from processing.quality import (
+     assess_image_quality,
+ )
+@@ -31,6 +35,10 @@ from processing.pattern import (
+     analyze_pattern,
+ )
+ 
++from processing.classifier import (
++    predict_pattern,
++)
++
+ from processing.minutiae import (
+     analyze_minutiae,
+ )
+@@ -160,7 +168,7 @@ def analyze_fingerprint(image):
+ 
+     mask, segmented = (
+         segment_fingerprint(
+-            enhanced
++            denoised
+         )
+     )
+ 
+@@ -191,9 +199,13 @@ def analyze_fingerprint(image):
+     # 4. Orientation estimation
+     # ========================================================
+ 
++    # Ridge orientation from the UNMASKED denoised image (a masked
++    # image has an artificial gradient along the mask border); the
++    # mask is applied inside the estimator.
+     orientation, coherence = (
+         estimate_orientation(
+-            segmented
++            denoised,
++            mask=mask,
+         )
+     )
+ 
+@@ -232,7 +244,10 @@ def analyze_fingerprint(image):
+         spacing,
+         frequency_results,
+     ) = estimate_ridge_frequency(
+-        segmented
++        denoised,
++        orientation=orientation,
++        mask=mask,
++        coherence=coherence,
+     )
+ 
+     # ========================================================
+@@ -243,7 +258,21 @@ def analyze_fingerprint(image):
+         density,
+         density_results,
+     ) = estimate_ridge_density(
+-        segmented
++        denoised,
++        orientation=orientation,
++        mask=mask,
++        coherence=coherence,
++    )
++
++    # ========================================================
++    # 6b. Gabor ridge enhancement (used for minutiae)
++    # ========================================================
++
++    gabor, gabor_response = gabor_enhance(
++        denoised,
++        orientation,
++        frequency,
++        mask,
+     )
+ 
+     # ========================================================
+@@ -258,15 +287,32 @@ def analyze_fingerprint(image):
+         block_size=16,
+     )
+ 
++    # Optional learned classifier (models/pattern_svm.joblib).
++    # When present and confident it decides the label; the
++    # singular-point evidence is kept for transparency.
++    learned = predict_pattern(gray)
++
++    if learned is not None:
++        rule_based = pattern_results["pattern"]
++        pattern_results["pattern"] = {
++            **learned,
++            "subtype": rule_based.get("subtype"),
++            "evidence": {
++                **(rule_based.get("evidence") or {}),
++                "rule_based_label": rule_based.get("label"),
++            },
++        }
++
+     # ========================================================
+     # 8. Minutiae analysis
+     # ========================================================
+ 
+     minutiae_results = analyze_minutiae(
+-        image=enhanced,
++        image=gabor,
+         mask=mask,
+         orientation=orientation,
+         coherence=coherence,
++        ridge_spacing=spacing,
+     )
+ 
+     # ========================================================
+@@ -320,6 +366,7 @@ def analyze_fingerprint(image):
+             "normalized": normalized,
+             "denoised": denoised,
+             "enhanced": enhanced,
++            "gabor": gabor,
+         },
+ 
+         "segmentation": {
+diff --git a/processing/segmentation.py b/processing/segmentation.py
+index 4e4f6f0..2da4033 100644
+--- a/processing/segmentation.py
++++ b/processing/segmentation.py
+@@ -1,11 +1,56 @@
+ import cv2
+ import numpy as np
++from scipy.ndimage import binary_fill_holes
+ 
+ 
+-def segment_fingerprint(image):
++def _largest_component(binary):
++    """Keep the largest 8-connected component of a boolean mask."""
++    count, labels, stats, _ = cv2.connectedComponentsWithStats(
++        binary.astype(np.uint8),
++        connectivity=8,
++    )
++
++    if count <= 1:
++        return binary.astype(bool)
++
++    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++
++    return labels == largest
++
++
++def segment_fingerprint(
++    image,
++    texture_sigma=None,
++    threshold_factor=1.0,
++):
+     """
+     Segment the fingerprint foreground from the background.
+ 
++    Method: local intensity standard deviation ("texture") ->
++    Otsu threshold -> opening -> largest component -> hole filling
++    -> closing -> hole filling.
++
++    Changes relative to the original implementation
++    -----------------------------------------------
++    1. The local-std window was GaussianBlur((21, 21), 0), i.e.
++       sigma ~ 3.5 px. That is smaller than one ridge period
++       (~10 px on 512 px NIST prints), so the texture measure
++       oscillated with ridge phase and low-contrast areas fell below
++       the Otsu threshold. The window is now ~8 px (scaled with the
++       image size), spanning about one ridge period.
++    2. The texture map is normalised by its 99th percentile rather
++       than its maximum, so a single dark blotch does not dictate
++       the Otsu threshold.
++    3. Interior holes are filled. Previously the mask was riddled
++       with holes, typically right at the print centre (the
++       low-contrast core / delta area) which made singular-point and
++       minutiae detection impossible exactly where it matters.
++
++    Args:
++        image: uint8 grayscale image (denoised, not CLAHE'd, works best).
++        texture_sigma: Gaussian sigma for the texture map in pixels.
++        threshold_factor: scale applied to the Otsu threshold.
++
+     Returns:
+         mask: Binary foreground mask (0 or 255)
+         segmented: Fingerprint image with background removed
+@@ -13,69 +58,63 @@ def segment_fingerprint(image):
+ 
+     image_float = image.astype(np.float32)
+ 
+-    # Local texture estimation
+-    mean = cv2.GaussianBlur(image_float, (21, 21), 0)
+-    mean_squared = cv2.GaussianBlur(image_float ** 2, (21, 21), 0)
++    height, width = image.shape[:2]
+ 
+-    local_variance = mean_squared - (mean ** 2)
+-    local_variance = np.maximum(local_variance, 0)
++    if texture_sigma is None:
++        texture_sigma = max(4.0, 8.0 * min(height, width) / 512.0)
+ 
+-    local_std = np.sqrt(local_variance)
++    mean = cv2.GaussianBlur(image_float, (0, 0), texture_sigma)
++    mean_squared = cv2.GaussianBlur(image_float ** 2, (0, 0), texture_sigma)
+ 
+-    # Normalize texture map
+-    texture_uint8 = cv2.normalize(
+-        local_std,
+-        None,
+-        0,
+-        255,
+-        cv2.NORM_MINMAX
++    local_std = np.sqrt(np.maximum(mean_squared - mean ** 2, 0.0))
++
++    reference = float(np.percentile(local_std, 99))
++
++    if reference <= 1e-6:
++        empty = np.zeros_like(image, dtype=np.uint8)
++        return empty, cv2.bitwise_and(image, image, mask=empty)
++
++    texture_uint8 = np.clip(
++        local_std / reference * 255.0, 0, 255
+     ).astype(np.uint8)
+ 
+-    # Automatic thresholding
+-    _, texture_mask = cv2.threshold(
++    otsu, _ = cv2.threshold(
+         texture_uint8,
+         0,
+         255,
+-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
++        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+     )
+ 
+-    # Morphological cleanup
+-    kernel = cv2.getStructuringElement(
+-        cv2.MORPH_ELLIPSE,
+-        (15, 15)
+-    )
++    mask = texture_uint8 > (otsu * float(threshold_factor))
+ 
+-    cleaned_mask = cv2.morphologyEx(
+-        texture_mask,
+-        cv2.MORPH_CLOSE,
+-        kernel
+-    )
++    scale = min(height, width) / 512.0
+ 
+-    # Keep largest connected region
+-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+-        cleaned_mask,
+-        connectivity=8
+-    )
++    open_k = max(3, int(round(15 * scale)) | 1)
++    close_k = max(5, int(round(31 * scale)) | 1)
+ 
+-    if num_labels <= 1:
+-        return cleaned_mask, cv2.bitwise_and(
+-            image,
+-            image,
+-            mask=cleaned_mask
+-        )
++    mask = cv2.morphologyEx(
++        mask.astype(np.uint8),
++        cv2.MORPH_OPEN,
++        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k)),
++    ).astype(bool)
+ 
+-    largest_label = 1 + np.argmax(
+-        stats[1:, cv2.CC_STAT_AREA]
+-    )
++    if not np.any(mask):
++        empty = np.zeros_like(image, dtype=np.uint8)
++        return empty, cv2.bitwise_and(image, image, mask=empty)
+ 
+-    mask = np.zeros_like(cleaned_mask)
+-    mask[labels == largest_label] = 255
++    mask = _largest_component(mask)
++    mask = binary_fill_holes(mask)
+ 
+-    # Apply mask
+-    segmented = cv2.bitwise_and(
+-        image,
+-        image,
+-        mask=mask
+-    )
++    mask = cv2.morphologyEx(
++        mask.astype(np.uint8),
++        cv2.MORPH_CLOSE,
++        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)),
++    ).astype(bool)
++
++    mask = binary_fill_holes(mask)
++
++    mask_uint8 = (mask.astype(np.uint8)) * 255
++
++    segmented = cv2.bitwise_and(image, image, mask=mask_uint8)
+ 
+-    return mask, segmented
+\ No newline at end of file
++    return mask_uint8, segmented
+diff --git a/requirements.txt b/requirements.txt
+index 3fe4a96b4bde7ac3d50be60e2c095a856c929014..74e3badf6851a6d58d4ab87de4d50fb00ea2b552 100644
+GIT binary patch
+literal 2110
+zcmZ8iO>^ru47~HdNTUybBnKaQe4V~&XI?Koc_@jp8B-)fQgM`D-(5;h($4r`0u-=V
+zEI?@&?M|m%S?|kQ$Z&DCDf)5Lr&9w<S$($^owkFvmk8%!a|U-mo$7MOn=vJKQx@*F
+ztjY$4#rA~>Gwzo#37Jy(`nZ#wGIZ5X@O4VgNsqIMZuYwk63j-){(3qca*AFB+#$FM
+z2##gbhz%^@)S|!25LGIy3zIbZLj^)%WxX>l$Vr|~6#^Y_o+kbWF8sI2&A~5^Li(jQ
+z{In`-fD?o2=F94RV#Yy@b5z6o1n?C=)Iz<h9^mbT)$o%MT)aeQV}Dgl3M+nMM5g4N
+z0S5rFN7du&V40Q}uXUYs9$>$w<a-wseO39K&+i%V6K?9kB4}GSmH08qi~8{=Q?$o&
+zC$wK~Dp(SG%$&oJt`13_%bHlX^Vu(#N!b+72I$!p5V*SUdbp?r3sNDqj&7KPOqxL&
+za6(nQr~zF7e-#eDYx^P_0;)kR>)z)=SRhZ{X`9wwFvWLbb|w0_-dedTqE|gy+~<T8
+zO9deUyLg#V38Sn)w_}0sMQ1?Np**0O53_n>aTx|1@-Um|GgV)vb2n=<tZ}J^?dG{R
+z8WA!Htnt&FoAMt-=cvLP1E9sZz7^<ZJ_GZltz^?H^m+FPWn`CS@Rbvm&$jR~M`p`Q
+z*S9nj!8gxm$2fQOQQY($T{9Wfsx2eKjm)7%!pM)MFiz&80ZIIXbN0XF2o@Qk6_ZTf
+zxMVaS;*%QM{W2BW8f|fx;{%6|Y38v-^qsKXgSkyAFgOb+;1c?y1Z_8RKw*IF$(U6!
+z6?t1|2OZU%Y#7tsg&S1gqO-W<lIom88AqJq-_GZF)!Qs1`#f<{8xY+J=auc>ipKyz
+zj+~`dc-i0NWgS;)#!EX$w1>4H^2zn1HfS7-D}Nq~1$(k8pUR`~+L*ld)~)7^Oe|>7
+zypL6il4{|Dn^d~0IetnBd{ON5_;ltXxM`5Uw0oe4SRr|A$*P}&I;%ICcT59b{n8V}
+zI!2ZFYa8E9b%?sqor_{45FyWfG03FWzzxQzD!q$|x49Gwjv}ORxiBndk?5AYwmyNx
+zj0=hW`R(T)94`vPFCWt@a-u=F8`P)*IL=w&K4#nNjCO(vu!E2yjD6d-&jo7H0OODe
+z%0NYQJU<=&@2EG&vB2|@B>K;RM>0P|^b&Eo``NeHYY<pyuE4BDvJ2z7tMRJTA}ZOr
+zfW?KBB;}W~L-Ti#5l;&C0`KcJ1F`ezi5jbe&SzYY2~r`2`Qc#BZJLKHhMWQq65dO0
+zpbQMFYA^5>EPaew%UtcK+Dd+N;HIxc3Q{MNmn_aycUnAHJgfJF2NbJzRT2wIA8Y;`
+zeJAFii=-xs4k<a&6>J8h+7dON(tD4EkWeAzx)XPW3B>cqmM}YSs19v&+hY#Z0|9K&
+Z^*219j{(N^2M617vE3&&N(Fo##J}_Hie3N!
+
+literal 4448
+zcmai%OK&1q5QXnLQho}S!DBmK%p%K)W|T;iO;!k+hp}<PG(F?Tk56*Gd%C#Y#!iF)
+zn_IUYr%pZkpTB3RPS0tRcIl&DAJSPGr_22LbNVUGQj^v?tJ5TnQk7PEZL;K~lR8W1
+z>3zvjnoGV;i~PAxhwkoGw$Q)Z$jW0r9qSA~Lhm89dhODET1t~OT;%gJd1c!N#Zb$?
+zQQFGm@12#iWI4;ArFqALxgwoQ|MqxuoPIg_z{yNnTSc+b_f}eV`rgaWA!_z{E(vZ_
+z={BDeZHcJTS<~qXEYB4QQrCJ<x~PU|lNa8^f?hInkfv5K*Yc)G5BhB@4_~r={3802
+z%Suw)EIG@vNSsRo&#pSXJDogapE;T6eQ`XgWs9gA#r>RRhMB7LYn3B!jvB^UhrM3N
+zuet882lqiaB1QsyiEELb<cafvFCb$*OPwrb$@!?Ik4W&9w`Eqs0^Z!^Ou-s3TOQ-K
+zv_C;~rO1en2tmm#Gcq9PyspwW`BfidFWBD7?zk5<x%8detaUH@<Y;-kOH4Nz+mLuV
+z-k)UdIg(AbILl|`bJFSklw(;-<EQj{J|&uqjMIm#caw3ZY8v?*+y=)|6_#m*4e^8H
+zjn2nCw1*PYtaB~f)M6`~ra9weBx=h%jZFCdqj<Scrr@iwCGSWYgN=UONdk7wBtt*4
+zKg5e9vPSeyTIeUiUrYGxH~n5K>oeiRIgxVH{0=r;9`Cx>g<gE972z&xX>&|{EzU@2
+zdCe)<;wm2M>&uN4=U#d%S)h|vy=bF1(hFdgGXXpAgbOuSJQ`v=Jf}|+2hq@nhyXtF
+zb~V42U#1_Db3Oyre&xQFr#|*suQ?aF9?DH~wQuADb?u&j-@bDi*HnJfzw8Nqm?Pvr
+z5bfiDe5tAbLToC3@qj4phb!MGzU4_@e%j&wkXb>Gb*AtOtFE?T>|5n^o)K~nc^i34
+zoz_(3pw#JG+TV-HsGUX?)=q2DcF5v&?i}}u6e%;Ppax#0=b^9BRK{CQTx;0n<VAdC
+z8t?RX$-gl}=1X^*jDFSME9C}F;ftBdOlu{9o>rfm4prMSo6z=_+$iUZJ9NLm)S34k
+zB5YM#agJ8r&S))LuNnEe7g>gCGfHi?<5^WE7E(+Y&uGgS$HG8-z?+dGj%|i6=st!V
+z`n>NT+bTn7yw@}g+^BH(C^iDR#a!QPPDpSciO?~WfK9i;YB>D^iSPP7ralPby)(4a
+z?^J9h1V&k=KTVKx{nF2TW3LD+`83l!AU83;OMgOwoe?A=Hng~l$LUU5=%L#jX@B|@
+zjv~v6w_9{j9cKAH--TJRce*o0w}ExAFEYo>2`f~!XA+;VX|FT3Co;pP!4`Ac(eR)@
+zBjVOxx9Bt8KBzylB&y-^h}}V&nUCI#%!$b9UT5qWQ@wx4_p&_^nR7`ND|s9Hqx+%l
+z5XT=n@6UJecg?^-_hEE|hLXXk9`g&CV8STp5<d2QM=LW9OqjW_zvwS_W8S)(tn(IO
+zuRU@5UeUFf;H|9pnRA(QL~MVhU)6g)=TjJm_2A{Ry4HhsJjWc^+9z<ONAV5YOWf9g
+zbdmg~NL|k{)v;oKLAjBxO26>BQQbIO>_{+<y2b}IgSs;pcW%VttN*=YR`%~)>yA51
+zD=Y3A?mxxzy*xN{b!-&k$)r>#`^-l53rFd(^j<c*@VL)!%fbatZLQ2FrYv)kc)jg8
+zVwhwWea&bu^xvP7p&$5(3hop>9^^$oo{|eHp9zD6w;V@h=Gg|kb4LoEdfUdA618`)
+z*Z~&O8}a%{(Rlj_(ND>-d$FGy6K{0pB9c6LSMu$k^T4O{F7u$4Z($8@d~T-kJUf#f
+zCS%#GErD$KM75f)bcQF%!(lM-o``LCG;W3NmyV4_qeNjg(rGrzKf0I=?v-W%nJFCw
+z$*o?@?u#5J*@FeP^e7CxlTh=4D(ANJC<{#DczTVB3M7gi<XoLROE_XnM=p(sHNp+%
+d5XiAJ4|h*uAYbOlaA#tkpW+xOn!}z|{{kcLk{AF0
+
+diff --git a/scripts/train_pattern_classifier.py b/scripts/train_pattern_classifier.py
+new file mode 100644
+index 0000000..07a3095
+--- /dev/null
++++ b/scripts/train_pattern_classifier.py
+@@ -0,0 +1,81 @@
++"""
++Train the HOG + SVM pattern classifier.
++
++    python scripts/train_pattern_classifier.py data/raw/NISTDB4
++
++Folder names must contain 'arc', 'loop' or 'whorl'.
++
++NOTE on evaluation: NIST SD4 contains two impressions (f/s) of every
++finger. A random split can put the same finger in train and test and
++inflate accuracy. If your file names let you recover the finger id,
++pass --group-regex to split by finger; otherwise treat the reported
++hold-out number as optimistic.
++"""
++import argparse
++import os
++import re
++import sys
++from pathlib import Path
++
++import cv2
++import joblib
++import numpy as np
++from sklearn.metrics import classification_report
++from sklearn.model_selection import GroupShuffleSplit, train_test_split
++from sklearn.pipeline import Pipeline
++from sklearn.preprocessing import StandardScaler
++from sklearn.svm import SVC
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from processing.classifier import MODEL_PATH, hog_features  # noqa: E402
++
++
++def label_of(path):
++    text = str(path).lower()
++    for label in ("arc", "loop", "whorl"):
++        if label in text:
++            return label
++    return None
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("root")
++    ap.add_argument("--group-regex", default=None,
++                    help="regex with one group extracting the finger id from the file name")
++    ap.add_argument("--out", default=MODEL_PATH)
++    args = ap.parse_args()
++
++    files = sorted(
++        p for p in Path(args.root).rglob("*")
++        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif"}
++    )
++    files = [(p, label_of(p)) for p in files]
++    files = [(p, y) for p, y in files if y]
++
++    X = np.vstack([hog_features(cv2.imread(str(p), 0)) for p, _ in files])
++    y = np.array([l for _, l in files])
++
++    if args.group_regex:
++        groups = np.array([re.search(args.group_regex, p.name).group(1) for p, _ in files])
++        tr, te = next(GroupShuffleSplit(1, test_size=0.2, random_state=42).split(X, y, groups))
++    else:
++        tr, te = train_test_split(np.arange(len(y)), test_size=0.2,
++                                  random_state=42, stratify=y)
++
++    model = Pipeline([
++        ("scale", StandardScaler()),
++        ("svc", SVC(kernel="rbf", C=5.0, gamma="scale", probability=True,
++                    class_weight="balanced", random_state=42)),
++    ])
++    model.fit(X[tr], y[tr])
++    print(classification_report(y[te], model.predict(X[te])))
++
++    os.makedirs(os.path.dirname(args.out), exist_ok=True)
++    model.fit(X, y)     # final model on all data
++    joblib.dump(model, args.out)
++    print("saved", args.out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_regressions.py b/tests/test_regressions.py
+new file mode 100644
+index 0000000..f5660ae
+--- /dev/null
++++ b/tests/test_regressions.py
+@@ -0,0 +1,83 @@
++"""Regression tests for the bugs found in the audit. Run: python -m pytest tests"""
++import itertools
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from processing.minutiae import _crossing_number, crossing_number_map
++from processing.pattern import compute_poincare_index
++from processing.orientation import estimate_orientation
++
++
++def _grid(theta_fn, n=9):
++    ys, xs = np.mgrid[0:n, 0:n]
++    z = (xs - n // 2) + 1j * (ys - n // 2)
++    return theta_fn(z).astype(np.float32), np.ones((n, n), bool)
++
++
++def test_poincare_core_is_plus_half():
++    th, v = _grid(lambda z: 0.5 * np.angle(z))
++    p = compute_poincare_index(th, v, radius=1)
++    assert abs(p[3, 3] - 0.5) < 1e-4
++
++
++def test_poincare_delta_is_minus_half():
++    th, v = _grid(lambda z: -0.5 * np.angle(z))
++    p = compute_poincare_index(th, v, radius=1)
++    assert abs(p[3, 3] + 0.5) < 1e-4
++
++
++def test_poincare_flat_is_zero():
++    th, v = _grid(lambda z: np.full(z.shape, 0.3))
++    assert abs(compute_poincare_index(th, v)[3, 3]) < 1e-6
++
++
++def test_poincare_centre_block_may_be_invalid():
++    th, v = _grid(lambda z: 0.5 * np.angle(z))
++    v[4, 4] = False
++    assert np.isfinite(compute_poincare_index(th, v)[3, 3])
++
++
++def _true_cn(nb):
++    p = nb.flatten()
++    ring = [p[0], p[1], p[2], p[5], p[8], p[7], p[6], p[3], p[0]]
++    return sum(abs(int(ring[i + 1]) - int(ring[i])) for i in range(8)) // 2
++
++
++def test_crossing_number_all_configs():
++    for bits in itertools.product([0, 1], repeat=8):
++        nb = np.zeros(9, np.uint8)
++        for b, i in zip(bits, [0, 1, 2, 3, 5, 6, 7, 8]):
++            nb[i] = b
++        nb[4] = 1
++        nb = nb.reshape(3, 3)
++        assert _crossing_number(nb) == _true_cn(nb)
++        assert crossing_number_map(np.pad(nb, 1).astype(bool))[2, 2] == _true_cn(nb)
++
++
++def test_orientation_is_ridge_direction_not_gradient():
++    h = w = 128
++    ys, xs = np.mgrid[0:h, 0:w]
++    ridge_angle = np.radians(30)             # ridges run at 30 deg
++    normal = -xs * np.sin(ridge_angle) + ys * np.cos(ridge_angle)
++    img = (127 + 100 * np.sin(2 * np.pi * normal / 10)).astype(np.uint8)
++    ori, coh = estimate_orientation(img)
++    est = float(np.median(ori[32:-32, 32:-32]))
++    diff = abs(np.angle(np.exp(2j * (est - ridge_angle)))) / 2
++    assert np.degrees(diff) < 3
++
++
++if __name__ == "__main__":      # runs without pytest
++    failed = 0
++    for name, fn in list(globals().items()):
++        if name.startswith("test_"):
++            try:
++                fn()
++                print("PASS", name)
++            except AssertionError:
++                failed += 1
++                print("FAIL", name)
++    sys.exit(failed)
